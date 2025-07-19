@@ -36,26 +36,26 @@ sl_price = None
 tp_price = None
 trailing_activated = False
 
+RSI_LO, RSI_HI = 45, 55
+
 # 📩 Telegram
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": msg}
-        requests.post(url, data=data)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
     except Exception as e:
         print(f"Telegram send failed: {e}")
 
 # 📊 Google Sheets
 def get_gsheet_client():
-    creds_dict = {
+    creds = {
         "type": "service_account",
         "client_email": GSHEET_CLIENT_EMAIL,
         "private_key": GSHEET_PRIVATE_KEY,
         "token_uri": "https://oauth2.googleapis.com/token"
     }
     scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    return gspread.authorize(creds)
+    return gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(creds, scope))
 
 def log_trade_to_sheet(data):
     try:
@@ -65,79 +65,90 @@ def log_trade_to_sheet(data):
     except Exception as e:
         print(f"GSheet log failed: {e}")
 
-# 📊 Get current forming candles from Binance
-def get_klines(symbol, interval='5m', limit=100):
-    raw = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-    df = pd.DataFrame(raw, columns=[
-        'open_time','open','high','low','close','volume',
-        'close_time','quote_asset_volume','num_trades',
-        'taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'
+# 📊 Get data from Binance (including current forming candle)
+def get_klines_binance(interval='5m', limit=100):
+    klines = client.futures_klines(symbol=SYMBOL, interval=interval, limit=limit)
+    df = pd.DataFrame(klines, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base', 'taker_buy_quote', 'ignore'
     ])
     df['time'] = pd.to_datetime(df['open_time'], unit='ms')
-    df[['open','high','low','close']] = df[['open','high','low','close']].astype(float)
-    return df
+    for col in ['open','high','low','close','volume']:
+        df[col] = df[col].astype(float)
+    return df[['time','open','high','low','close','volume']]
 
 # 📈 Indicators
 def add_indicators(df):
     df['rsi'] = ta.momentum.rsi(df['close'], window=14)
     bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+    df['bb_mid']  = bb.bollinger_mavg()
     df['bb_high'] = bb.bollinger_hband()
-    df['bb_low'] = bb.bollinger_lband()
-    df['bb_mid'] = bb.bollinger_mavg()
+    df['bb_low']  = bb.bollinger_lband()
     return df
 
 # 📊 Signal logic
 def check_signal():
-    df_5m = add_indicators(get_klines(SYMBOL, '5m'))
-    df_1h = add_indicators(get_klines(SYMBOL, '1h'))
-
+    df_5m = add_indicators(get_klines_binance('5m'))
+    df_1h = add_indicators(get_klines_binance('1h'))
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
-    if abs(c1h['close'] - c1h['open']) / c1h['open'] < 0.001:
+    # RSI filter
+    if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
+
+    # No trade if 1h candle touching BB
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
-    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] - 100 and \
-       c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+    # Trend Buy
+    if (c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] - 100 and
+        c5['close'] > c5['open'] and c1h['close'] > c1h['open']):
         return 'trend_buy'
 
-    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] + 100 and \
-       c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+    # Trend Sell
+    if (c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] + 100 and
+        c5['close'] < c5['open'] and c1h['close'] < c1h['open']):
         return 'trend_sell'
 
-    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and \
-       c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+    # Reversal Buy
+    if (c1h['close'] > c1h['open'] and c5['close'] > c5['open'] and
+        c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and
+        (c5['close'] - c5['bb_low']) >= 100):
         return 'reversal_buy'
 
-    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and \
-       c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+    # Reversal Sell
+    if (c1h['close'] < c1h['open'] and c5['close'] < c5['open'] and
+        c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and
+        (c5['bb_high'] - c5['close']) >= 100):
         return 'reversal_sell'
 
     return None
 
-# 🛠 Trade
+# 🛠 Place order
 def place_order(order_type):
     global in_position, entry_price, sl_price, tp_price, trailing_activated
     side = SIDE_BUY if 'buy' in order_type else SIDE_SELL
 
     order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-
-    # Get price safely
     price = None
     if 'avgFillPrice' in order:
         price = float(order['avgFillPrice'])
     elif 'fills' in order and len(order['fills']) > 0:
         price = float(order['fills'][0]['price'])
     else:
-        ticker = client.futures_symbol_ticker(symbol=SYMBOL)
-        price = float(ticker['price'])
+        price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
-    df_1h = get_klines(SYMBOL, '1h')
-    sl_price = df_1h.iloc[-1]['open']
+    df_1h = add_indicators(get_klines_binance('1h'))
+    df_5m = add_indicators(get_klines_binance('5m'))
 
-    df_5m = add_indicators(get_klines(SYMBOL, '5m'))
+    if 'trend' in order_type:
+        sl_price = df_1h.iloc[-1]['open']
+    else:
+        c5 = df_5m.iloc[-1]
+        sl_price = c5['low'] if order_type == 'reversal_buy' else c5['high']
+
     tp_price = df_5m.iloc[-1]['bb_high'] if side == SIDE_BUY else df_5m.iloc[-1]['bb_low']
 
     in_position = True
@@ -149,10 +160,10 @@ def place_order(order_type):
     send_telegram(msg)
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, entry_price, sl_price, tp_price, "Opened"])
 
+# 🔄 Manage trade
 def manage_trade():
     global in_position, trailing_activated
-    ticker = client.futures_symbol_ticker(symbol=SYMBOL)
-    price = float(ticker['price'])
+    price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
     if not trailing_activated and (price - entry_price) / entry_price >= 0.05:
         trailing_activated = True
@@ -168,12 +179,12 @@ def manage_trade():
         elif price >= tp_price:
             close_position(price, "Take Profit Hit")
 
+# ❌ Close trade
 def close_position(exit_price, reason):
     global in_position
     side = SIDE_SELL if entry_price < exit_price else SIDE_BUY
     client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-
-    msg = f"❌ Closed trade at {exit_price} ({reason})"
+    msg = f"❌ Closed at {exit_price} ({reason})"
     print(msg)
     send_telegram(msg)
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, "close", entry_price, sl_price, tp_price, f"Closed: {reason}"])
@@ -181,7 +192,6 @@ def close_position(exit_price, reason):
 
 # 🚀 Bot loop
 def bot_loop():
-    global in_position
     while True:
         try:
             if not in_position:
@@ -199,10 +209,10 @@ def bot_loop():
 app = Flask(__name__)
 
 @app.route('/')
-def index():
-    return "🚀 Trading bot is running!"
+def home():
+    return "🚀 Live bot running!"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     threading.Thread(target=bot_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=port)

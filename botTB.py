@@ -35,8 +35,10 @@ entry_price = None
 sl_price = None
 tp_price = None
 trailing_activated = False
+trailing_peak = None
 
 RSI_LO, RSI_HI = 45, 55
+TRAIL_PERCENT = 0.02  # 2% trailing
 
 # 📩 Telegram
 def send_telegram(msg):
@@ -65,7 +67,7 @@ def log_trade_to_sheet(data):
     except Exception as e:
         print(f"GSheet log failed: {e}")
 
-# 📊 Get data from Binance (including current forming candle)
+# 📊 Get data from Binance
 def get_klines_binance(interval='5m', limit=100):
     klines = client.futures_klines(symbol=SYMBOL, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=[
@@ -128,17 +130,11 @@ def check_signal():
 
 # 🛠 Place order
 def place_order(order_type):
-    global in_position, entry_price, sl_price, tp_price, trailing_activated
+    global in_position, entry_price, sl_price, tp_price, trailing_activated, trailing_peak
     side = SIDE_BUY if 'buy' in order_type else SIDE_SELL
 
     order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-    price = None
-    if 'avgFillPrice' in order:
-        price = float(order['avgFillPrice'])
-    elif 'fills' in order and len(order['fills']) > 0:
-        price = float(order['fills'][0]['price'])
-    else:
-        price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+    price = float(order['avgFillPrice']) if 'avgFillPrice' in order else float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
     df_1h = add_indicators(get_klines_binance('1h'))
     df_5m = add_indicators(get_klines_binance('5m'))
@@ -154,6 +150,7 @@ def place_order(order_type):
     in_position = True
     entry_price = price
     trailing_activated = False
+    trailing_peak = price
 
     msg = f"✅ Opened {order_type.upper()} at {entry_price}\nSL: {sl_price}\nTP: {tp_price}"
     print(msg)
@@ -162,16 +159,17 @@ def place_order(order_type):
 
 # 🔄 Manage trade
 def manage_trade():
-    global in_position, trailing_activated
+    global in_position, trailing_activated, trailing_peak
     price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
-    if not trailing_activated and (price - entry_price) / entry_price >= 0.05:
+    if not trailing_activated and (price - entry_price) / entry_price >= TRAIL_PERCENT:
         trailing_activated = True
+        trailing_peak = price
         send_telegram("🚀 Trailing stop activated")
 
     if trailing_activated:
-        peak = max(price, entry_price * 1.05)
-        if price < peak * 0.99:
+        trailing_peak = max(trailing_peak, price)
+        if price < trailing_peak * (1 - TRAIL_PERCENT):
             close_position(price, "Trailing Stop Hit")
     else:
         if price <= sl_price:

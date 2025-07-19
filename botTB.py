@@ -12,7 +12,6 @@ from binance.client import Client
 from binance.enums import *
 from flask import Flask
 
-
 load_dotenv()
 
 # ✅ Config
@@ -72,12 +71,7 @@ def get_klines(symbol, interval='5min', limit=100):
     for api_key in TD_API_KEYS:
         try:
             url = "https://api.twelvedata.com/time_series"
-            params = {
-                "symbol": symbol,
-                "interval": interval,
-                "outputsize": limit,
-                "apikey": api_key
-            }
+            params = {"symbol": symbol, "interval": interval, "outputsize": limit, "apikey": api_key}
             r = requests.get(url, params=params, timeout=10)
             data = r.json()
             if "values" not in data:
@@ -107,59 +101,35 @@ def add_indicators(df):
 def check_signal():
     df_5m = add_indicators(get_klines(SYMBOL, '5min'))
     df_1h = add_indicators(get_klines(SYMBOL, '1h'))
-
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
-
-    # No trade if 1h candle indecisive or touching BB
     if abs(c1h['close'] - c1h['open']) / c1h['open'] < 0.001:
         return None
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
-
-    # Trend Buy
-    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] - 100 and \
-       c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] - 100 and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
-
-    # Trend Sell
-    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] + 100 and \
-       c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] + 100 and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'trend_sell'
-
-    # Reversal Buy
-    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and \
-       c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'reversal_buy'
-
-    # Reversal Sell
-    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and \
-       c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'reversal_sell'
-
     return None
 
 # 🛠 Trade
 def place_order(order_type):
     global in_position, entry_price, sl_price, tp_price, trailing_activated
     side = SIDE_BUY if 'buy' in order_type else SIDE_SELL
-
-    order = client.futures_create_order(
-        symbol='BTCUSDT', side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-    price = float(order['avgFillPrice'] if 'avgFillPrice' in order else order['fills'][0]['price'])
-
-    # SL = open of current 1h candle
+    order = client.futures_create_order(symbol='BTCUSDT', side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
+    price = float(order.get('avgFillPrice') or order['fills'][0]['price'])
     df_1h = get_klines(SYMBOL, '1h')
     sl_price = df_1h.iloc[-1]['open']
-
-    # TP = nearest BB on 5m
     df_5m = add_indicators(get_klines(SYMBOL, '5min'))
     tp_price = df_5m.iloc[-1]['bb_high'] if side == SIDE_BUY else df_5m.iloc[-1]['bb_low']
-
     in_position = True
     entry_price = price
     trailing_activated = False
-
     msg = f"✅ Opened {order_type.upper()} at {entry_price}\nSL: {sl_price}\nTP: {tp_price}"
     print(msg)
     send_telegram(msg)
@@ -169,59 +139,35 @@ def manage_trade():
     global in_position, trailing_activated
     ticker = client.futures_symbol_ticker(symbol='BTCUSDT')
     price = float(ticker['price'])
-
     if not trailing_activated and (price - entry_price) / entry_price >= 0.05:
         trailing_activated = True
         send_telegram("🚀 Trailing stop activated")
-
-    if trailing_activated:
-        peak = max(price, entry_price * 1.05)
-        if price < peak * 0.99:
-            close_position(price, "Trailing Stop Hit")
-    else:
-        if price <= sl_price:
-            close_position(price, "Stop Loss Hit")
-        elif price >= tp_price:
-            close_position(price, "Take Profit Hit")
+    peak = max(price, entry_price * 1.05)
+    if trailing_activated and price < peak * 0.99:
+        close_position(price, "Trailing Stop Hit")
+    elif price <= sl_price:
+        close_position(price, "Stop Loss Hit")
+    elif price >= tp_price:
+        close_position(price, "Take Profit Hit")
 
 def close_position(exit_price, reason):
     global in_position
     side = SIDE_SELL if entry_price < exit_price else SIDE_BUY
     client.futures_create_order(symbol='BTCUSDT', side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-
     msg = f"❌ Closed trade at {exit_price} ({reason})"
     print(msg)
     send_telegram(msg)
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, "close", entry_price, sl_price, tp_price, f"Closed: {reason}"])
     in_position = False
 
-# 🚀 Run loop
-def run_bot():
-    global in_position
-    while True:
-        try:
-            if not in_position:
-                signal = check_signal()
-                if signal:
-                    place_order(signal)
-            else:
-                manage_trade()
-        except Exception as e:
-            print(f"Error: {e}")
-            send_telegram(f"⚠ Error: {e}")
-        time.sleep(60)
-
-if __name__ == "__main__":
-    run_bot()
-
+# 🌐 Flask app
 app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Trading bot is running."
+    return "🚀 Trading bot is running."
 
 def bot_loop():
-    global in_position
     while True:
         try:
             if not in_position:
@@ -237,10 +183,6 @@ def bot_loop():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-
-    # Run your bot loop in a background thread so it doesn't block Flask
     thread = threading.Thread(target=bot_loop, daemon=True)
     thread.start()
-
-    # Start the Flask web server
     app.run(host='0.0.0.0', port=port)

@@ -1,18 +1,14 @@
-# Use slim Python image
-FROM python:3.12-slim
+FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy code
 COPY . .
 
-# Set env variables (optional default)
-ENV PYTHONUNBUFFERED=1
+ENV PORT=5000
 
-# Run the bot
+EXPOSE 5000
+
 CMD ["python", "botTB.py"]

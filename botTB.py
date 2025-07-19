@@ -2,6 +2,7 @@ import os
 import time
 from datetime import datetime
 import pandas as pd
+import threading
 from dotenv import load_dotenv
 import ta
 import requests
@@ -9,6 +10,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from binance.client import Client
 from binance.enums import *
+from flask import Flask
+
 
 load_dotenv()
 
@@ -210,3 +213,34 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Trading bot is running."
+
+def bot_loop():
+    global in_position
+    while True:
+        try:
+            if not in_position:
+                signal = check_signal()
+                if signal:
+                    place_order(signal)
+            else:
+                manage_trade()
+        except Exception as e:
+            print(f"Error: {e}")
+            send_telegram(f"⚠ Error: {e}")
+        time.sleep(60)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+
+    # Run your bot loop in a background thread so it doesn't block Flask
+    thread = threading.Thread(target=bot_loop, daemon=True)
+    thread.start()
+
+    # Start the Flask web server
+    app.run(host='0.0.0.0', port=port)

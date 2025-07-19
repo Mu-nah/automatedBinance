@@ -1,0 +1,7 @@
+python-binance==1.0.17
+pandas
+requests
+python-dotenv
+gspread
+oauth2client
+ta

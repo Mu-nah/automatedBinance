@@ -45,8 +45,8 @@ def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-    except Exception as e:
-        print(f"Telegram send failed: {e}")
+    except Exception:
+        pass  # silently ignore telegram errors
 
 # 📊 Google Sheets
 def get_gsheet_client():
@@ -64,8 +64,8 @@ def log_trade_to_sheet(data):
         gc = get_gsheet_client()
         sheet = gc.open_by_key(GSHEET_ID).sheet1
         sheet.append_row(data)
-    except Exception as e:
-        print(f"GSheet log failed: {e}")
+    except Exception:
+        pass  # silently ignore sheet logging errors
 
 # 📊 Get data from Binance
 def get_klines_binance(interval='5m', limit=100):
@@ -134,7 +134,7 @@ def place_order(order_type):
     side = SIDE_BUY if 'buy' in order_type else SIDE_SELL
 
     order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-    price = float(order['avgFillPrice']) if 'avgFillPrice' in order else float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+    price = float(order.get('avgFillPrice') or client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
     df_1h = add_indicators(get_klines_binance('1h'))
     df_5m = add_indicators(get_klines_binance('5m'))
@@ -152,9 +152,7 @@ def place_order(order_type):
     trailing_activated = False
     trailing_peak = price
 
-    msg = f"✅ Opened {order_type.upper()} at {entry_price}\nSL: {sl_price}\nTP: {tp_price}"
-    print(msg)
-    send_telegram(msg)
+    send_telegram(f"✅ Opened {order_type.upper()} at {entry_price}\nSL: {sl_price}\nTP: {tp_price}")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, entry_price, sl_price, tp_price, "Opened"])
 
 # 🔄 Manage trade
@@ -182,9 +180,7 @@ def close_position(exit_price, reason):
     global in_position
     side = SIDE_SELL if entry_price < exit_price else SIDE_BUY
     client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-    msg = f"❌ Closed at {exit_price} ({reason})"
-    print(msg)
-    send_telegram(msg)
+    send_telegram(f"❌ Closed at {exit_price} ({reason})")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, "close", entry_price, sl_price, tp_price, f"Closed: {reason}"])
     in_position = False
 
@@ -198,10 +194,9 @@ def bot_loop():
                     place_order(signal)
             else:
                 manage_trade()
-        except Exception as e:
-            print(f"Error: {e}")
-            send_telegram(f"⚠ Error: {e}")
-        time.sleep(180)  # every 3 minutes
+        except Exception:
+            pass  # silently ignore and retry
+        time.sleep(180)
 
 # 🌐 Flask app
 app = Flask(__name__)

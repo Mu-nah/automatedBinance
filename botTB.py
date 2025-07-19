@@ -1,5 +1,6 @@
 import os
 import time
+import json
 from datetime import datetime
 import pandas as pd
 import threading
@@ -22,10 +23,6 @@ TRADE_QUANTITY = 0.001
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-GSHEET_ID = os.getenv("GSHEET_ID")
-GSHEET_CLIENT_EMAIL = os.getenv("GSHEET_CLIENT_EMAIL")
-GSHEET_PRIVATE_KEY = os.getenv("GSHEET_PRIVATE_KEY").replace('\\n', '\n')
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
 client.futures_change_leverage(symbol=SYMBOL, leverage=10)
@@ -50,19 +47,16 @@ def send_telegram(msg):
 
 # 📊 Google Sheets
 def get_gsheet_client():
-    creds = {
-        "type": "service_account",
-        "client_email": GSHEET_CLIENT_EMAIL,
-        "private_key": GSHEET_PRIVATE_KEY,
-        "token_uri": "https://oauth2.googleapis.com/token"
-    }
+    creds_json = os.getenv("GOOGLE_CREDENTIALS")
+    creds_dict = json.loads(creds_json)
     scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
-    return gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(creds, scope))
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    return gspread.authorize(creds)
 
 def log_trade_to_sheet(data):
     try:
         gc = get_gsheet_client()
-        sheet = gc.open_by_key(GSHEET_ID).sheet1
+        sheet = gc.open_by_key(os.getenv("GSHEET_ID")).sheet1
         sheet.append_row(data)
     except Exception:
         pass
@@ -96,32 +90,26 @@ def check_signal():
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
-    # Filter RSI neutral zone
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
 
-    # No trade if 1h close touches BB
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
     # Trend Buy
-    if (c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and
-        c5['close'] > c5['open'] and c1h['close'] > c1h['open']):
+    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
 
     # Trend Sell
-    if (c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and
-        c5['close'] < c5['open'] and c1h['close'] < c1h['open']):
+    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'trend_sell'
 
     # Reversal Buy
-    if (c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and
-        c5['close'] > c5['open'] and c1h['close'] > c1h['open']):
+    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'reversal_buy'
 
     # Reversal Sell
-    if (c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and
-        c5['close'] < c5['open'] and c1h['close'] < c1h['open']):
+    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'reversal_sell'
 
     return None
@@ -139,19 +127,8 @@ def place_order(order_type):
     c1h = df_1h.iloc[-1]
     c5 = df_5m.iloc[-1]
 
-    # SL
-    if 'trend' in order_type:
-        sl_price = c1h['open']
-    else:
-        sl_price = c5['open']
-
-    # TP
-    if 'trend_buy' in order_type:
-        tp_price = c5['bb_high']
-    elif 'trend_sell' in order_type:
-        tp_price = c5['bb_low']
-    else:  # reversal
-        tp_price = c5['bb_mid']
+    sl_price = c1h['open'] if 'trend' in order_type else c5['open']
+    tp_price = c5['bb_high'] if 'buy' in order_type else c5['bb_low'] if 'trend' in order_type else c5['bb_mid']
 
     entry_price = price
     trailing_peak = price
@@ -167,7 +144,7 @@ def manage_trade():
     price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
     profit_pct = (price - entry_price) / entry_price if entry_price else 0
 
-    # Dynamic trailing logic
+    # Dynamic trail
     if profit_pct >= 0.03:
         current_trail_percent = 0.015
     elif profit_pct >= 0.02:
@@ -191,8 +168,9 @@ def close_position(exit_price, reason):
     global in_position
     side = SIDE_SELL if entry_price < exit_price else SIDE_BUY
     client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-    send_telegram(f"❌ Closed at {exit_price} ({reason})")
-    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, "close", entry_price, sl_price, tp_price, f"Closed: {reason}"])
+    pnl = round(exit_price - entry_price, 2)
+    send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL: {pnl}")
+    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, "close", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
     in_position = False
 
 # 🚀 Bot loop
@@ -207,7 +185,7 @@ def bot_loop():
                 manage_trade()
         except Exception:
             pass
-        time.sleep(180)  # every 3 minutes
+        time.sleep(180)
 
 # 🌐 Flask app
 app = Flask(__name__)

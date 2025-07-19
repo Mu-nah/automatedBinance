@@ -15,10 +15,9 @@ from flask import Flask
 load_dotenv()
 
 # ✅ Config
-TD_API_KEYS = os.getenv("TD_API_KEYS").split(",")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL = "BTC/USD"  # Twelve Data uses BTC/USD not BTCUSDT
+SYMBOL = "BTCUSDT"
 TRADE_QUANTITY = 0.001
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -66,32 +65,17 @@ def log_trade_to_sheet(data):
     except Exception as e:
         print(f"GSheet log failed: {e}")
 
-# 📊 Get data from Twelve Data
-def get_klines(symbol, interval='5min', limit=100):
-    for api_key in TD_API_KEYS:
-        try:
-            url = "https://api.twelvedata.com/time_series"
-            params = {
-                "symbol": symbol,
-                "interval": interval,
-                "outputsize": limit,
-                "apikey": api_key
-            }
-            r = requests.get(url, params=params, timeout=10)
-            data = r.json()
-            if "values" not in data:
-                print(f"TwelveData error: {data}")
-                continue
-            df = pd.DataFrame(data['values'])
-            df = df.rename(columns={'datetime':'time'})
-            df['time'] = pd.to_datetime(df['time'])
-            df[['open','high','low','close']] = df[['open','high','low','close']].astype(float)
-            df = df.sort_values('time').reset_index(drop=True)
-            return df
-        except Exception as e:
-            print(f"TwelveData key failed: {api_key}, error: {e}")
-            continue
-    raise Exception("All TwelveData API keys failed!")
+# 📊 Get current forming candles from Binance
+def get_klines(symbol, interval='5m', limit=100):
+    raw = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(raw, columns=[
+        'open_time','open','high','low','close','volume',
+        'close_time','quote_asset_volume','num_trades',
+        'taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'
+    ])
+    df['time'] = pd.to_datetime(df['open_time'], unit='ms')
+    df[['open','high','low','close']] = df[['open','high','low','close']].astype(float)
+    return df
 
 # 📈 Indicators
 def add_indicators(df):
@@ -104,7 +88,7 @@ def add_indicators(df):
 
 # 📊 Signal logic
 def check_signal():
-    df_5m = add_indicators(get_klines(SYMBOL, '5min'))
+    df_5m = add_indicators(get_klines(SYMBOL, '5m'))
     df_1h = add_indicators(get_klines(SYMBOL, '1h'))
 
     c5 = df_5m.iloc[-1]
@@ -138,23 +122,22 @@ def place_order(order_type):
     global in_position, entry_price, sl_price, tp_price, trailing_activated
     side = SIDE_BUY if 'buy' in order_type else SIDE_SELL
 
-    order = client.futures_create_order(
-        symbol='BTCUSDT', side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
+    order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
 
-    # Safe price handling
+    # Get price safely
     price = None
     if 'avgFillPrice' in order:
         price = float(order['avgFillPrice'])
     elif 'fills' in order and len(order['fills']) > 0:
         price = float(order['fills'][0]['price'])
     else:
-        ticker = client.futures_symbol_ticker(symbol='BTCUSDT')
+        ticker = client.futures_symbol_ticker(symbol=SYMBOL)
         price = float(ticker['price'])
 
     df_1h = get_klines(SYMBOL, '1h')
     sl_price = df_1h.iloc[-1]['open']
 
-    df_5m = add_indicators(get_klines(SYMBOL, '5min'))
+    df_5m = add_indicators(get_klines(SYMBOL, '5m'))
     tp_price = df_5m.iloc[-1]['bb_high'] if side == SIDE_BUY else df_5m.iloc[-1]['bb_low']
 
     in_position = True
@@ -168,7 +151,7 @@ def place_order(order_type):
 
 def manage_trade():
     global in_position, trailing_activated
-    ticker = client.futures_symbol_ticker(symbol='BTCUSDT')
+    ticker = client.futures_symbol_ticker(symbol=SYMBOL)
     price = float(ticker['price'])
 
     if not trailing_activated and (price - entry_price) / entry_price >= 0.05:
@@ -188,7 +171,7 @@ def manage_trade():
 def close_position(exit_price, reason):
     global in_position
     side = SIDE_SELL if entry_price < exit_price else SIDE_BUY
-    client.futures_create_order(symbol='BTCUSDT', side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
+    client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
 
     msg = f"❌ Closed trade at {exit_price} ({reason})"
     print(msg)
@@ -210,14 +193,14 @@ def bot_loop():
         except Exception as e:
             print(f"Error: {e}")
             send_telegram(f"⚠ Error: {e}")
-        time.sleep(60)
+        time.sleep(180)  # every 3 minutes
 
 # 🌐 Flask app
 app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Trading bot is running 🚀"
+    return "🚀 Trading bot is running!"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

@@ -36,9 +36,9 @@ sl_price = None
 tp_price = None
 trailing_activated = False
 trailing_peak = None
+current_trail_percent = 0.0
 
 RSI_LO, RSI_HI = 45, 55
-TRAIL_PERCENT = 0.02  # 2% trailing
 
 # 📩 Telegram
 def send_telegram(msg):
@@ -46,7 +46,7 @@ def send_telegram(msg):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
     except Exception:
-        pass  # silently ignore telegram errors
+        pass  # silently ignore
 
 # 📊 Google Sheets
 def get_gsheet_client():
@@ -65,9 +65,9 @@ def log_trade_to_sheet(data):
         sheet = gc.open_by_key(GSHEET_ID).sheet1
         sheet.append_row(data)
     except Exception:
-        pass  # silently ignore sheet logging errors
+        pass  # silently ignore
 
-# 📊 Get data from Binance
+# 📊 Get data
 def get_klines_binance(interval='5m', limit=100):
     klines = client.futures_klines(symbol=SYMBOL, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=[
@@ -130,7 +130,7 @@ def check_signal():
 
 # 🛠 Place order
 def place_order(order_type):
-    global in_position, entry_price, sl_price, tp_price, trailing_activated, trailing_peak
+    global in_position, entry_price, sl_price, tp_price, trailing_activated, trailing_peak, current_trail_percent
     side = SIDE_BUY if 'buy' in order_type else SIDE_SELL
 
     order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
@@ -151,24 +151,38 @@ def place_order(order_type):
     entry_price = price
     trailing_activated = False
     trailing_peak = price
+    current_trail_percent = 0.0
 
     send_telegram(f"✅ Opened {order_type.upper()} at {entry_price}\nSL: {sl_price}\nTP: {tp_price}")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, entry_price, sl_price, tp_price, "Opened"])
 
 # 🔄 Manage trade
 def manage_trade():
-    global in_position, trailing_activated, trailing_peak
+    global in_position, trailing_activated, trailing_peak, current_trail_percent
     price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
-    if not trailing_activated and (price - entry_price) / entry_price >= TRAIL_PERCENT:
+    profit_pct = (price - entry_price) / entry_price if entry_price else 0
+
+    # Move SL to breakeven after +0.5%
+    if not trailing_activated and profit_pct >= 0.005:
         trailing_activated = True
         trailing_peak = price
-        send_telegram("🚀 Trailing stop activated")
+        current_trail_percent = 0.005
+        send_telegram("🛡 SL moved to breakeven")
 
     if trailing_activated:
         trailing_peak = max(trailing_peak, price)
-        if price < trailing_peak * (1 - TRAIL_PERCENT):
-            close_position(price, "Trailing Stop Hit")
+        # Update trail % dynamically
+        if profit_pct >= 0.03:
+            current_trail_percent = 0.015
+        elif profit_pct >= 0.02:
+            current_trail_percent = 0.01
+        elif profit_pct >= 0.01:
+            current_trail_percent = 0.005
+
+        # Close if price drops below peak minus trail
+        if price < trailing_peak * (1 - current_trail_percent):
+            close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
     else:
         if price <= sl_price:
             close_position(price, "Stop Loss Hit")
@@ -195,7 +209,7 @@ def bot_loop():
             else:
                 manage_trade()
         except Exception:
-            pass  # silently ignore and retry
+            pass  # silently ignore
         time.sleep(180)
 
 # 🌐 Flask app

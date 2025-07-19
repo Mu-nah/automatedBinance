@@ -19,6 +19,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = "BTCUSDT"
 TRADE_QUANTITY = 0.001
+LEVERAGE = 10
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -28,6 +29,7 @@ GSHEET_CLIENT_EMAIL = os.getenv("GSHEET_CLIENT_EMAIL")
 GSHEET_PRIVATE_KEY = os.getenv("GSHEET_PRIVATE_KEY").replace('\\n', '\n')
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
+client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
 
 # ✅ State
 in_position = False
@@ -46,7 +48,7 @@ def send_telegram(msg):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
     except Exception:
-        pass  # silently ignore
+        pass
 
 # 📊 Google Sheets
 def get_gsheet_client():
@@ -65,10 +67,10 @@ def log_trade_to_sheet(data):
         sheet = gc.open_by_key(GSHEET_ID).sheet1
         sheet.append_row(data)
     except Exception:
-        pass  # silently ignore
+        pass
 
 # 📊 Get data
-def get_klines_binance(interval='5m', limit=100):
+def get_klines(interval='5m', limit=100):
     klines = client.futures_klines(symbol=SYMBOL, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
@@ -80,7 +82,7 @@ def get_klines_binance(interval='5m', limit=100):
         df[col] = df[col].astype(float)
     return df[['time','open','high','low','close','volume']]
 
-# 📈 Indicators
+# 📈 Add indicators
 def add_indicators(df):
     df['rsi'] = ta.momentum.rsi(df['close'], window=14)
     bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
@@ -91,40 +93,36 @@ def add_indicators(df):
 
 # 📊 Signal logic
 def check_signal():
-    df_5m = add_indicators(get_klines_binance('5m'))
-    df_1h = add_indicators(get_klines_binance('1h'))
+    df_5m = add_indicators(get_klines('5m'))
+    df_1h = add_indicators(get_klines('1h'))
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
-    # RSI filter
+    # Filter: 1h candle must match direction and not touching BB lines
+    if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
+        return None
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
 
-    # No trade if 1h candle touching BB
-    if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
-        return None
-
     # Trend Buy
-    if (c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] - 100 and
-        c5['close'] > c5['open'] and c1h['close'] > c1h['open']):
-        return 'trend_buy'
+    if c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+        if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high']:
+            return 'trend_buy'
 
     # Trend Sell
-    if (c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] + 100 and
-        c5['close'] < c5['open'] and c1h['close'] < c1h['open']):
-        return 'trend_sell'
+    if c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+        if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low']:
+            return 'trend_sell'
 
     # Reversal Buy
-    if (c1h['close'] > c1h['open'] and c5['close'] > c5['open'] and
-        c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and
-        (c5['close'] - c5['bb_low']) >= 100):
-        return 'reversal_buy'
+    if c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+        if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low']:
+            return 'reversal_buy'
 
     # Reversal Sell
-    if (c1h['close'] < c1h['open'] and c5['close'] < c5['open'] and
-        c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and
-        (c5['bb_high'] - c5['close']) >= 100):
-        return 'reversal_sell'
+    if c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+        if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high']:
+            return 'reversal_sell'
 
     return None
 
@@ -136,16 +134,18 @@ def place_order(order_type):
     order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
     price = float(order.get('avgFillPrice') or client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
-    df_1h = add_indicators(get_klines_binance('1h'))
-    df_5m = add_indicators(get_klines_binance('5m'))
+    df_1h = add_indicators(get_klines('1h'))
+    df_5m = add_indicators(get_klines('5m'))
+    c1h = df_1h.iloc[-1]
+    c5 = df_5m.iloc[-1]
 
+    # SL logic
     if 'trend' in order_type:
-        sl_price = df_1h.iloc[-1]['open']
+        sl_price = c1h['open']
+        tp_price = c5['bb_high'] if side == SIDE_BUY else c5['bb_low']
     else:
-        c5 = df_5m.iloc[-1]
-        sl_price = c5['low'] if order_type == 'reversal_buy' else c5['high']
-
-    tp_price = df_5m.iloc[-1]['bb_high'] if side == SIDE_BUY else df_5m.iloc[-1]['bb_low']
+        sl_price = c5['open']
+        tp_price = c5['bb_mid']
 
     in_position = True
     entry_price = price
@@ -160,27 +160,21 @@ def place_order(order_type):
 def manage_trade():
     global in_position, trailing_activated, trailing_peak, current_trail_percent
     price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
-
     profit_pct = (price - entry_price) / entry_price if entry_price else 0
 
-    # Move SL to breakeven after +0.5%
-    if not trailing_activated and profit_pct >= 0.005:
+    # Activate trailing based on profit levels
+    if profit_pct >= 0.03:
+        current_trail_percent = 0.015
         trailing_activated = True
-        trailing_peak = price
+    elif profit_pct >= 0.02:
+        current_trail_percent = 0.01
+        trailing_activated = True
+    elif profit_pct >= 0.01:
         current_trail_percent = 0.005
-        send_telegram("🛡 SL moved to breakeven")
+        trailing_activated = True
 
     if trailing_activated:
         trailing_peak = max(trailing_peak, price)
-        # Update trail % dynamically
-        if profit_pct >= 0.03:
-            current_trail_percent = 0.015
-        elif profit_pct >= 0.02:
-            current_trail_percent = 0.01
-        elif profit_pct >= 0.01:
-            current_trail_percent = 0.005
-
-        # Close if price drops below peak minus trail
         if price < trailing_peak * (1 - current_trail_percent):
             close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
     else:
@@ -209,8 +203,8 @@ def bot_loop():
             else:
                 manage_trade()
         except Exception:
-            pass  # silently ignore
-        time.sleep(180)
+            pass
+        time.sleep(180)  # every 3 minutes
 
 # 🌐 Flask app
 app = Flask(__name__)

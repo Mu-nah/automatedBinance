@@ -23,6 +23,7 @@ TRADE_QUANTITY = 0.001
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GSHEET_ID = os.getenv("GSHEET_ID")
+SPREAD_THRESHOLD = 15  # USD
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
 client.futures_change_leverage(symbol=SYMBOL, leverage=10)
@@ -91,9 +92,11 @@ def check_signal():
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
+    # RSI neutral filter
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
 
+    # Avoid if 1h touches BB
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
@@ -116,11 +119,21 @@ def check_signal():
 def place_order(order_type):
     global in_position, entry_price, sl_price, tp_price, trailing_peak, current_trail_percent, trade_direction
 
+    # Check spread first
+    order_book = client.futures_order_book(symbol=SYMBOL)
+    ask = float(order_book['asks'][0][0])
+    bid = float(order_book['bids'][0][0])
+    spread = ask - bid
+    if spread > SPREAD_THRESHOLD:
+        send_telegram(f"⚠ Spread too wide (${spread:.2f}), skipping trade.")
+        return
+
     side = SIDE_BUY if 'buy' in order_type else SIDE_SELL
     trade_direction = 'long' if 'buy' in order_type else 'short'
 
     order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-    price = float(order.get('avgFillPrice') or client.futures_symbol_ticker(symbol=SYMBOL)['price'])
+    # Use fills for accurate entry price
+    price = float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else float(order.get('avgFillPrice') or client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
     df_1h = add_indicators(get_klines('1h'))
     df_5m = add_indicators(get_klines('5m'))
@@ -150,7 +163,7 @@ def manage_trade():
     price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
     profit_pct = abs((price - entry_price) / entry_price) if entry_price else 0
 
-    # Dynamic trailing
+    # Dynamic trailing tightening
     if profit_pct >= 0.03:
         current_trail_percent = 0.015
     elif profit_pct >= 0.02:
@@ -167,13 +180,13 @@ def manage_trade():
             close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
             return
 
-    # TP & SL logic
+    # TP & SL
     if trade_direction == 'long':
         if price <= sl_price:
             close_position(price, "Stop Loss Hit")
         elif price >= tp_price:
             close_position(price, "Take Profit Hit")
-    else:  # short
+    else:
         if price >= sl_price:
             close_position(price, "Stop Loss Hit")
         elif price <= tp_price:
@@ -186,7 +199,6 @@ def close_position(exit_price, reason):
     client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
 
     pnl = round(exit_price - entry_price, 2) if trade_direction == 'long' else round(entry_price - exit_price, 2)
-
     send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL: {pnl}")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close ({trade_direction})", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
     in_position = False

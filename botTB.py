@@ -34,7 +34,7 @@ sl_price = None
 tp_price = None
 trailing_peak = None
 current_trail_percent = 0.0
-current_order_type = None  # to remember trade type (trend_buy etc.)
+trade_direction = None  # 'long' or 'short'
 
 RSI_LO, RSI_HI = 45, 55
 
@@ -62,7 +62,7 @@ def log_trade_to_sheet(data):
     except Exception:
         pass
 
-# 📊 Fetch data
+# 📊 Get data
 def get_klines(interval='5m', limit=100):
     klines = client.futures_klines(symbol=SYMBOL, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=[
@@ -75,7 +75,7 @@ def get_klines(interval='5m', limit=100):
         df[col] = df[col].astype(float)
     return df
 
-# 📈 Add indicators
+# 📈 Indicators
 def add_indicators(df):
     df['rsi'] = ta.momentum.rsi(df['close'], window=14)
     bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
@@ -93,15 +93,20 @@ def check_signal():
 
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
+
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
+    # Trend Buy
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
+    # Trend Sell
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'trend_sell'
+    # Reversal Buy
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'reversal_buy'
+    # Reversal Sell
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'reversal_sell'
 
@@ -109,8 +114,10 @@ def check_signal():
 
 # 🛠 Place order
 def place_order(order_type):
-    global in_position, entry_price, sl_price, tp_price, trailing_peak, current_trail_percent, current_order_type
+    global in_position, entry_price, sl_price, tp_price, trailing_peak, current_trail_percent, trade_direction
+
     side = SIDE_BUY if 'buy' in order_type else SIDE_SELL
+    trade_direction = 'long' if 'buy' in order_type else 'short'
 
     order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
     price = float(order.get('avgFillPrice') or client.futures_symbol_ticker(symbol=SYMBOL)['price'])
@@ -121,6 +128,7 @@ def place_order(order_type):
     c5 = df_5m.iloc[-1]
 
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
+
     if 'trend_buy' in order_type:
         tp_price = c5['bb_high']
     elif 'trend_sell' in order_type:
@@ -131,11 +139,10 @@ def place_order(order_type):
     entry_price = price
     trailing_peak = price
     current_trail_percent = 0.0
-    current_order_type = order_type
     in_position = True
 
     send_telegram(f"✅ Opened {order_type.upper()} at {entry_price}\nSL: {sl_price}\nTP: {tp_price}")
-    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, entry_price, sl_price, tp_price, "Opened"])
+    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, entry_price, sl_price, tp_price, f"Opened ({trade_direction})"])
 
 # 🔄 Manage trade
 def manage_trade():
@@ -143,6 +150,7 @@ def manage_trade():
     price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
     profit_pct = abs((price - entry_price) / entry_price) if entry_price else 0
 
+    # Dynamic trailing
     if profit_pct >= 0.03:
         current_trail_percent = 0.015
     elif profit_pct >= 0.02:
@@ -151,29 +159,37 @@ def manage_trade():
         current_trail_percent = 0.005
 
     if current_trail_percent > 0:
-        trailing_peak = max(trailing_peak, price)
-        if price < trailing_peak * (1 - current_trail_percent):
+        trailing_peak = max(trailing_peak, price) if trade_direction == 'long' else min(trailing_peak, price)
+        if trade_direction == 'long' and price < trailing_peak * (1 - current_trail_percent):
+            close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
+            return
+        elif trade_direction == 'short' and price > trailing_peak * (1 + current_trail_percent):
             close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
             return
 
-    if price <= sl_price:
-        close_position(price, "Stop Loss Hit")
-    elif price >= tp_price:
-        close_position(price, "Take Profit Hit")
+    # TP & SL logic
+    if trade_direction == 'long':
+        if price <= sl_price:
+            close_position(price, "Stop Loss Hit")
+        elif price >= tp_price:
+            close_position(price, "Take Profit Hit")
+    else:  # short
+        if price >= sl_price:
+            close_position(price, "Stop Loss Hit")
+        elif price <= tp_price:
+            close_position(price, "Take Profit Hit")
 
 # ❌ Close trade
 def close_position(exit_price, reason):
-    global in_position, current_order_type
-    is_sell = 'sell' in current_order_type
-    side = SIDE_BUY if is_sell else SIDE_SELL
-
+    global in_position
+    side = SIDE_SELL if trade_direction == 'long' else SIDE_BUY
     client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-    pnl = round((entry_price - exit_price) if is_sell else (exit_price - entry_price), 2)
+
+    pnl = round(exit_price - entry_price, 2) if trade_direction == 'long' else round(entry_price - exit_price, 2)
 
     send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL: {pnl}")
-    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, current_order_type, entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
+    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close ({trade_direction})", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
     in_position = False
-    current_order_type = None
 
 # 🚀 Bot loop
 def bot_loop():

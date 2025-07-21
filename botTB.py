@@ -92,17 +92,32 @@ def check_signal():
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
+    # 🕒 Filter out last 10 mins of 1h candle
+    now = datetime.utcnow()
+    last_1h_open_time = pd.to_datetime(c1h['time'])
+    last_10min_start = last_1h_open_time + pd.Timedelta(minutes=50)
+    if now >= last_10min_start:
+        send_telegram(f"⚠ Skipping signal: last 10 minutes of 1h candle.")
+        return None
+
+    # RSI neutral filter
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
+
+    # Avoid if 1h touches BB
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
+    # Trend Buy
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
+    # Trend Sell
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'trend_sell'
+    # Reversal Buy
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'reversal_buy'
+    # Reversal Sell
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'reversal_sell'
 
@@ -112,7 +127,7 @@ def check_signal():
 def place_order(order_type):
     global in_position, entry_price, sl_price, tp_price, trailing_peak, current_trail_percent, trade_direction
 
-    # Check spread first
+    # Spread filter
     order_book = client.futures_order_book(symbol=SYMBOL)
     ask = float(order_book['asks'][0][0])
     bid = float(order_book['bids'][0][0])
@@ -133,12 +148,7 @@ def place_order(order_type):
     c5 = df_5m.iloc[-1]
 
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
-    if 'trend_buy' in order_type:
-        tp_price = c5['bb_high']
-    elif 'trend_sell' in order_type:
-        tp_price = c5['bb_low']
-    else:
-        tp_price = c5['bb_mid']
+    tp_price = c5['bb_high'] if 'trend_buy' in order_type else c5['bb_low'] if 'trend_sell' in order_type else c5['bb_mid']
 
     entry_price = price
     trailing_peak = price
@@ -187,9 +197,7 @@ def close_position(exit_price, reason):
     side = SIDE_SELL if trade_direction == 'long' else SIDE_BUY
     client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
 
-    # ✅ Use TRADE_QUANTITY to calculate real PnL in USD
-    pnl = round((exit_price - entry_price) * TRADE_QUANTITY, 2) if trade_direction == 'long' else round((entry_price - exit_price) * TRADE_QUANTITY, 2)
-
+    pnl = round(exit_price - entry_price, 2) if trade_direction == 'long' else round(entry_price - exit_price, 2)
     send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL: {pnl}")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close ({trade_direction})", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
     in_position = False

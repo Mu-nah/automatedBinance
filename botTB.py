@@ -92,24 +92,17 @@ def check_signal():
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
-    # RSI neutral filter
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
-
-    # Avoid if 1h touches BB
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
-    # Trend Buy
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
-    # Trend Sell
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'trend_sell'
-    # Reversal Buy
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'reversal_buy'
-    # Reversal Sell
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'reversal_sell'
 
@@ -132,7 +125,6 @@ def place_order(order_type):
     trade_direction = 'long' if 'buy' in order_type else 'short'
 
     order = client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
-    # Use fills for accurate entry price
     price = float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else float(order.get('avgFillPrice') or client.futures_symbol_ticker(symbol=SYMBOL)['price'])
 
     df_1h = add_indicators(get_klines('1h'))
@@ -141,12 +133,11 @@ def place_order(order_type):
     c5 = df_5m.iloc[-1]
 
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
-
     if 'trend_buy' in order_type:
         tp_price = c5['bb_high']
     elif 'trend_sell' in order_type:
         tp_price = c5['bb_low']
-    else:  # reversal
+    else:
         tp_price = c5['bb_mid']
 
     entry_price = price
@@ -163,7 +154,6 @@ def manage_trade():
     price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
     profit_pct = abs((price - entry_price) / entry_price) if entry_price else 0
 
-    # Dynamic trailing tightening
     if profit_pct >= 0.03:
         current_trail_percent = 0.015
     elif profit_pct >= 0.02:
@@ -180,7 +170,6 @@ def manage_trade():
             close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
             return
 
-    # TP & SL
     if trade_direction == 'long':
         if price <= sl_price:
             close_position(price, "Stop Loss Hit")
@@ -198,7 +187,9 @@ def close_position(exit_price, reason):
     side = SIDE_SELL if trade_direction == 'long' else SIDE_BUY
     client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
 
-    pnl = round(exit_price - entry_price, 2) if trade_direction == 'long' else round(entry_price - exit_price, 2)
+    # ✅ Use TRADE_QUANTITY to calculate real PnL in USD
+    pnl = round((exit_price - entry_price) * TRADE_QUANTITY, 2) if trade_direction == 'long' else round((entry_price - exit_price) * TRADE_QUANTITY, 2)
+
     send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL: {pnl}")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close ({trade_direction})", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
     in_position = False

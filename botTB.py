@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import threading
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from binance.client import Client
 from binance.enums import *
 from flask import Flask
+from collections import deque
 
 load_dotenv()
 
@@ -36,6 +37,7 @@ tp_price = None
 trailing_peak = None
 current_trail_percent = 0.0
 trade_direction = None  # 'long' or 'short'
+daily_trades = deque()  # store (pnl, is_win)
 
 RSI_LO, RSI_HI = 45, 55
 
@@ -92,32 +94,23 @@ def check_signal():
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
-    # 🕒 Filter out last 10 mins of 1h candle
+    # Skip last 10 minutes of 1h candle
     now = datetime.utcnow()
-    last_1h_open_time = pd.to_datetime(c1h['time'])
-    last_10min_start = last_1h_open_time + pd.Timedelta(minutes=50)
-    if now >= last_10min_start:
-        send_telegram(f"⚠ Skipping signal: last 10 minutes of 1h candle.")
+    minutes = now.minute
+    if minutes >= 50:
         return None
 
-    # RSI neutral filter
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
-
-    # Avoid if 1h touches BB
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
-    # Trend Buy
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
-    # Trend Sell
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'trend_sell'
-    # Reversal Buy
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'reversal_buy'
-    # Reversal Sell
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'reversal_sell'
 
@@ -127,7 +120,7 @@ def check_signal():
 def place_order(order_type):
     global in_position, entry_price, sl_price, tp_price, trailing_peak, current_trail_percent, trade_direction
 
-    # Spread filter
+    # Spread check
     order_book = client.futures_order_book(symbol=SYMBOL)
     ask = float(order_book['asks'][0][0])
     bid = float(order_book['bids'][0][0])
@@ -196,11 +189,35 @@ def close_position(exit_price, reason):
     global in_position
     side = SIDE_SELL if trade_direction == 'long' else SIDE_BUY
     client.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
+    pnl = round((exit_price - entry_price) * 1 if trade_direction == 'long' else (entry_price - exit_price) * 1, 2)
+    is_win = pnl > 0
+    daily_trades.append((pnl, is_win))
 
-    pnl = round(exit_price - entry_price, 2) if trade_direction == 'long' else round(entry_price - exit_price, 2)
     send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL: {pnl}")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close ({trade_direction})", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
     in_position = False
+
+# 📊 Daily summary
+def send_daily_summary():
+    if not daily_trades:
+        send_telegram("📊 Daily Summary:\nNo trades today.")
+        return
+    total_pnl = sum(p for p, _ in daily_trades)
+    num_trades = len(daily_trades)
+    num_wins = sum(1 for _, win in daily_trades if win)
+    win_rate = (num_wins / num_trades) * 100 if num_trades else 0
+    biggest_win = max((p for p, _ in daily_trades if p > 0), default=0)
+    biggest_loss = min((p for p, _ in daily_trades if p < 0), default=0)
+    msg = (
+        f"📊 *Daily Summary* (UTC)\n"
+        f"Total trades: {num_trades}\n"
+        f"Win rate: {win_rate:.1f}%\n"
+        f"Total PnL: {total_pnl:.2f}\n"
+        f"Biggest win: {biggest_win}\n"
+        f"Biggest loss: {biggest_loss}"
+    )
+    send_telegram(msg)
+    daily_trades.clear()
 
 # 🚀 Bot loop
 def bot_loop():
@@ -216,6 +233,14 @@ def bot_loop():
             pass
         time.sleep(180)
 
+# 🕒 Daily scheduler
+def daily_scheduler():
+    while True:
+        now = datetime.utcnow()
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        time.sleep((next_midnight - now).total_seconds())
+        send_daily_summary()
+
 # 🌐 Flask app
 app = Flask(__name__)
 
@@ -226,4 +251,5 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     threading.Thread(target=bot_loop, daemon=True).start()
+    threading.Thread(target=daily_scheduler, daemon=True).start()
     app.run(host="0.0.0.0", port=port)

@@ -39,7 +39,7 @@ current_trail_percent = 0.0
 trade_direction = None  # 'long' or 'short'
 daily_trades = deque()  # store (pnl, is_win)
 
-RSI_LO, RSI_HI = 45, 55
+RSI_LO, RSI_HI = 47, 53
 
 # 📩 Telegram
 def send_telegram(msg):

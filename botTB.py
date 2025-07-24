@@ -21,11 +21,12 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL = "BTCUSDT"
 TRADE_QUANTITY = 0.001
+SPREAD_THRESHOLD = 600  # USD
+DAILY_TARGET = 1000  # USD
+RSI_LO, RSI_HI = 47, 53
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GSHEET_ID = os.getenv("GSHEET_ID")
-SPREAD_THRESHOLD = 600  # USD
-DAILY_TARGET = 1000  # USD
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
 client.futures_change_leverage(symbol=SYMBOL, leverage=10)
@@ -38,10 +39,8 @@ tp_price = None
 trailing_peak = None
 current_trail_percent = 0.0
 trade_direction = None  # 'long' or 'short'
-daily_trades = deque()  # store (pnl, is_win)
+daily_trades = deque()  # (pnl, is_win)
 target_hit = False
-
-RSI_LO, RSI_HI = 47, 53
 
 # 📩 Telegram
 def send_telegram(msg):
@@ -55,7 +54,7 @@ def send_telegram(msg):
 def get_gsheet_client():
     creds_json = os.getenv("GOOGLE_CREDENTIALS")
     creds_dict = json.loads(creds_json)
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     return gspread.authorize(creds)
 
@@ -76,7 +75,7 @@ def get_klines(interval='5m', limit=100):
         'taker_buy_base', 'taker_buy_quote', 'ignore'
     ])
     df['time'] = pd.to_datetime(df['open_time'].astype(float), unit='ms')
-    for col in ['open', 'high', 'low', 'close', 'volume']:
+    for col in ['open','high','low','close','volume']:
         df[col] = df[col].astype(float)
     return df
 
@@ -84,22 +83,22 @@ def get_klines(interval='5m', limit=100):
 def add_indicators(df):
     df['rsi'] = ta.momentum.rsi(df['close'], window=14)
     bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-    df['bb_mid'] = bb.bollinger_mavg()
+    df['bb_mid']  = bb.bollinger_mavg()
     df['bb_high'] = bb.bollinger_hband()
-    df['bb_low'] = bb.bollinger_lband()
+    df['bb_low']  = bb.bollinger_lband()
     return df
 
 # 📊 Signal logic
 def check_signal():
     if target_hit:
         return None
+
     df_5m = add_indicators(get_klines('5m'))
     df_1h = add_indicators(get_klines('1h'))
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
-    # Skip last 10 minutes of 1h candle
-    now = datetime.now(timezone.utc) + timedelta(hours=1)  # convert to WAT
+    now = datetime.now(timezone.utc) + timedelta(hours=1)  # WAT
     if now.minute >= 50:
         return None
 
@@ -108,20 +107,16 @@ def check_signal():
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
-    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+    if c5['close'] > c5['bb_mid'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
-    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+    if c5['close'] < c5['bb_mid'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'trend_sell'
-    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
-        return 'reversal_buy'
-    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
-        return 'reversal_sell'
     return None
 
 # 🛠 Place order
 def place_order(order_type):
     global in_position, entry_price, sl_price, tp_price, trailing_peak, current_trail_percent, trade_direction
-    if target_hit:
+    if target_hit or in_position:
         return
 
     order_book = client.futures_order_book(symbol=SYMBOL)
@@ -141,8 +136,13 @@ def place_order(order_type):
     df_5m = add_indicators(get_klines('5m'))
     c1h = df_1h.iloc[-1]
     c5 = df_5m.iloc[-1]
+
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
-    tp_price = c5['bb_high'] if 'trend_buy' in order_type else c5['bb_low'] if 'trend_sell' in order_type else c5['bb_mid']
+    # Ensure TP is always in profit direction
+    if trade_direction == 'long':
+        tp_price = max(price + abs(c5['bb_high'] - price), price)
+    else:
+        tp_price = min(price - abs(price - c5['bb_low']), price)
 
     entry_price = price
     trailing_peak = price
@@ -156,23 +156,28 @@ def place_order(order_type):
 def manage_trade():
     global in_position, trailing_peak, current_trail_percent
     price = float(client.futures_symbol_ticker(symbol=SYMBOL)['price'])
-    profit_pct = abs((price - entry_price) / entry_price) if entry_price else 0
 
-    if profit_pct >= 0.03:
-        current_trail_percent = 0.015
-    elif profit_pct >= 0.02:
-        current_trail_percent = 0.01
-    elif profit_pct >= 0.01:
-        current_trail_percent = 0.005
+    # Move in profit
+    move = price - entry_price if trade_direction == 'long' else entry_price - price
+    profit_pct = move / entry_price
 
-    if current_trail_percent > 0:
-        trailing_peak = max(trailing_peak, price) if trade_direction == 'long' else min(trailing_peak, price)
-        if trade_direction == 'long' and price < trailing_peak * (1 - current_trail_percent):
-            close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
-            return
-        elif trade_direction == 'short' and price > trailing_peak * (1 + current_trail_percent):
-            close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
-            return
+    if profit_pct >= 0.002:
+        if current_trail_percent == 0.0:
+            current_trail_percent = 0.001  # 0.1%
+            trailing_peak = price
+        else:
+            if trade_direction == 'long':
+                trailing_peak = max(trailing_peak, price)
+                stop_price = trailing_peak * (1 - current_trail_percent)
+                if price <= stop_price:
+                    close_position(price, f"Trailing Stop Hit (peak={trailing_peak:.1f})")
+                    return
+            else:
+                trailing_peak = min(trailing_peak, price)
+                stop_price = trailing_peak * (1 + current_trail_percent)
+                if price >= stop_price:
+                    close_position(price, f"Trailing Stop Hit (peak={trailing_peak:.1f})")
+                    return
 
     if trade_direction == 'long':
         if price <= sl_price:
@@ -244,7 +249,7 @@ def bot_loop():
 # 🕒 Daily scheduler
 def daily_scheduler():
     while True:
-        now = datetime.utcnow() + timedelta(hours=1)  # to WAT
+        now = datetime.utcnow() + timedelta(hours=1)  # WAT
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
         send_daily_summary()

@@ -24,7 +24,7 @@ TRADE_QUANTITY = 0.001
 SPREAD_THRESHOLD = 600  # USD
 DAILY_TARGET = 1000  # USD
 RSI_LO, RSI_HI = 47, 53
-ENTRY_BUFFER = 0.8  # ≈ 80 pips ($0.8)
+ENTRY_BUFFER = 0.8  # ~80 pips ($0.8)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -39,6 +39,7 @@ client_live = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 in_position = False
 pending_order_id = None
 pending_order_side = None
+pending_order_time = None
 entry_price = None
 sl_price = None
 tp_price = None
@@ -102,7 +103,7 @@ def check_signal():
     df_1h = add_indicators(get_klines('1h'))
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
-    now = datetime.now(timezone.utc) + timedelta(hours=1)  # WAT
+    now = datetime.now(timezone.utc) + timedelta(hours=1)
     if now.minute >= 50:
         return None
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
@@ -119,18 +120,18 @@ def check_signal():
         return 'reversal_sell'
     return None
 
-# 🛠 Place order (stop entry with buffer)
+# 🛠 Place stop order
 def place_order(order_type):
-    global pending_order_id, pending_order_side, in_position, entry_price, sl_price, tp_price, trade_direction
+    global pending_order_id, pending_order_side, pending_order_time
+    global sl_price, tp_price, trade_direction
     if target_hit or in_position:
         return
 
-    # Cancel previous pending if opposite
     new_side = 'buy' if 'buy' in order_type else 'sell'
     if pending_order_id and pending_order_side != new_side:
         try:
             client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
-            send_telegram("⚠ Previous pending order canceled (new opposite signal)")
+            send_telegram("⚠ Canceled previous pending (new opposite signal)")
         except:
             pass
         pending_order_id = None
@@ -148,23 +149,34 @@ def place_order(order_type):
     c1h = df_1h.iloc[-1]
     c5 = df_5m.iloc[-1]
 
-    # Calculate stop price with buffer
-    stop_price = (ask + ENTRY_BUFFER) if 'buy' in order_type else (bid - ENTRY_BUFFER)
-    sl = c1h['open'] if 'trend' in order_type else c5['open']
-    tp = max(stop_price, c5['bb_high']) if 'buy' in order_type else min(stop_price, c5['bb_low'])
+    stop_price = round(ask + ENTRY_BUFFER, 2) if 'buy' in order_type else round(bid - ENTRY_BUFFER, 2)
+    sl_price = c1h['open'] if 'trend' in order_type else c5['open']
+    tp_price = max(stop_price, c5['bb_high']) if 'buy' in order_type else min(stop_price, c5['bb_low'])
+    trade_direction = 'long' if 'buy' in order_type else 'short'
 
     res = client_testnet.futures_create_order(
         symbol=SYMBOL, side=SIDE_BUY if 'buy' in order_type else SIDE_SELL,
-        type=FUTURE_ORDER_TYPE_STOP_MARKET, quantity=TRADE_QUANTITY,
-        stopPrice=round(stop_price,2)
+        type=FUTURE_ORDER_TYPE_STOP_MARKET, stopPrice=stop_price, quantity=TRADE_QUANTITY
     )
     pending_order_id = res['orderId']
     pending_order_side = new_side
-    sl_price, tp_price = sl, tp
-    trade_direction = 'long' if 'buy' in order_type else 'short'
+    pending_order_time = datetime.utcnow()
 
-    send_telegram(f"🟩 Placed STOP_MARKET {order_type.upper()} at {stop_price} (+buffer)\nSL: {sl_price} | TP: {tp_price}")
+    send_telegram(f"🟩 STOP_MARKET {order_type.upper()} at {stop_price} (+buffer)\nSL: {sl_price} | TP: {tp_price}")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, stop_price, sl_price, tp_price, f"Pending ({trade_direction})"])
+
+# 🛑 Cancel if pending >10min
+def cancel_pending_if_needed():
+    global pending_order_id, pending_order_time
+    if pending_order_id and pending_order_time:
+        if datetime.utcnow() - pending_order_time > timedelta(minutes=10):
+            try:
+                client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
+                send_telegram("🕒 Pending stop order canceled after 10 minutes")
+            except:
+                pass
+            pending_order_id = None
+            pending_order_time = None
 
 # 🔄 Manage trade
 def manage_trade():
@@ -186,6 +198,7 @@ def bot_loop():
     while True:
         try:
             if not in_position:
+                cancel_pending_if_needed()
                 signal = check_signal()
                 if signal:
                     place_order(signal)

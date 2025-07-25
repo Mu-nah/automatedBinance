@@ -236,7 +236,7 @@ def send_daily_summary():
         biggest_win = max((p for p, _ in daily_trades if p > 0), default=0)
         biggest_loss = min((p for p, _ in daily_trades if p < 0), default=0)
         msg = (
-            f"📊 *Daily Summary* (WAT)\n"
+            f"📊 *Yesterday Summary* (WAT)\n"
             f"Total trades: {len(daily_trades)}\n"
             f"Win rate: {win_rate:.1f}%\n"
             f"Total PnL: {total_pnl:.2f}\n"

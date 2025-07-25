@@ -229,7 +229,7 @@ def close_position(exit_price, reason):
 def send_daily_summary():
     global daily_trades, target_hit
     if not daily_trades:
-        send_telegram("📊 Daily Summary:\nNo trades today.")
+        send_telegram("📊 Yesterday Summary:\nNo trades.")
     else:
         total_pnl = sum(p for p, _ in daily_trades)
         win_rate = (sum(1 for _, win in daily_trades if win) / len(daily_trades)) * 100 if daily_trades else 0

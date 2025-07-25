@@ -24,7 +24,7 @@ TRADE_QUANTITY = 0.001
 SPREAD_THRESHOLD = 600  # USD
 DAILY_TARGET = 1000  # USD
 RSI_LO, RSI_HI = 47, 53
-ENTRY_BUFFER = 0.8  # ~80 pips ($0.8)
+ENTRY_BUFFER = 0.8  # ≈ 80 pips
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -178,30 +178,101 @@ def cancel_pending_if_needed():
             pending_order_id = None
             pending_order_time = None
 
-# 🔄 Manage trade
+# 🔄 Manage trade (unchanged)
 def manage_trade():
-    # Same as before
-    ...
+    global in_position, trailing_peak, current_trail_percent
+    price = float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
+    profit_pct = abs((price - entry_price) / entry_price) if entry_price else 0
+
+    if profit_pct >= 0.03:
+        current_trail_percent = 0.015
+    elif profit_pct >= 0.02:
+        current_trail_percent = 0.01
+    elif profit_pct >= 0.01:
+        current_trail_percent = 0.005
+
+    if current_trail_percent > 0:
+        trailing_peak = max(trailing_peak, price) if trade_direction == 'long' else min(trailing_peak, price)
+        if trade_direction == 'long' and price < trailing_peak * (1 - current_trail_percent):
+            close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
+            return
+        elif trade_direction == 'short' and price > trailing_peak * (1 + current_trail_percent):
+            close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
+            return
+
+    if trade_direction == 'long':
+        if price <= sl_price:
+            close_position(price, "Stop Loss Hit")
+        elif price >= tp_price:
+            close_position(price, "Take Profit Hit")
+    else:
+        if price >= sl_price:
+            close_position(price, "Stop Loss Hit")
+        elif price <= tp_price:
+            close_position(price, "Take Profit Hit")
 
 # ❌ Close trade
 def close_position(exit_price, reason):
-    # Same as before
-    ...
+    global in_position, target_hit
+    side = SIDE_SELL if trade_direction == 'long' else SIDE_BUY
+    client_testnet.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
+    pnl = round((exit_price - entry_price) if trade_direction == 'long' else (entry_price - exit_price), 2)
+    daily_trades.append((pnl, pnl > 0))
+    if sum(p for p, _ in daily_trades) >= DAILY_TARGET:
+        target_hit = True
+
+    send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL: {pnl}")
+    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close ({trade_direction})", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
+    in_position = False
 
 # 📊 Daily summary
 def send_daily_summary():
-    # Same as before
-    ...
+    global daily_trades, target_hit
+    if not daily_trades:
+        send_telegram("📊 Daily Summary:\nNo trades today.")
+    else:
+        total_pnl = sum(p for p, _ in daily_trades)
+        win_rate = (sum(1 for _, win in daily_trades if win) / len(daily_trades)) * 100 if daily_trades else 0
+        biggest_win = max((p for p, _ in daily_trades if p > 0), default=0)
+        biggest_loss = min((p for p, _ in daily_trades if p < 0), default=0)
+        msg = (
+            f"📊 *Daily Summary* (WAT)\n"
+            f"Total trades: {len(daily_trades)}\n"
+            f"Win rate: {win_rate:.1f}%\n"
+            f"Total PnL: {total_pnl:.2f}\n"
+            f"Biggest win: {biggest_win}\n"
+            f"Biggest loss: {biggest_loss}\n"
+            f"{'🎯 Daily target hit ✅' if target_hit else '🎯 Daily target not reached ❌'}"
+        )
+        send_telegram(msg)
+    daily_trades.clear()
+    target_hit = False
 
 # 🚀 Bot loop
 def bot_loop():
+    global in_position, pending_order_id, entry_price, trailing_peak, current_trail_percent
     while True:
         try:
             if not in_position:
                 cancel_pending_if_needed()
-                signal = check_signal()
-                if signal:
-                    place_order(signal)
+                if pending_order_id:
+                    try:
+                        order = client_testnet.futures_get_order(symbol=SYMBOL, orderId=pending_order_id)
+                        if order['status'] == 'FILLED':
+                            entry_price = float(order.get('avgFillPrice') or order.get('stopPrice'))
+                            in_position = True
+                            trailing_peak = entry_price
+                            current_trail_percent = 0.0
+                            send_telegram(f"✅ STOP order triggered at {entry_price}")
+                            log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"Triggered ({trade_direction})", entry_price, sl_price, tp_price, "Opened"])
+                            pending_order_id = None
+                            pending_order_time = None
+                    except:
+                        pass
+                else:
+                    signal = check_signal()
+                    if signal:
+                        place_order(signal)
             else:
                 manage_trade()
         except Exception:

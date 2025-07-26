@@ -262,7 +262,7 @@ def bot_loop():
                 manage_trade()
         except Exception:
             pass
-        time.sleep(180)
+        time.sleep(120)
 
 # 🕒 Daily scheduler
 def daily_scheduler():

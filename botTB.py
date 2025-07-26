@@ -32,7 +32,7 @@ trade_direction, daily_trades, target_hit = None, deque(), False
 def send_telegram(msg):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": msg})
+                      data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
     except: pass
 
 # 📊 Google Sheets
@@ -46,7 +46,7 @@ def log_trade_to_sheet(data):
         get_gsheet_client().open_by_key(GSHEET_ID).sheet1.append_row(data)
     except: pass
 
-# 📊 Get data & indicators
+# 📊 Data & indicators
 def get_klines(interval='5m', limit=100):
     df = pd.DataFrame(client_live.futures_klines(symbol=SYMBOL, interval=interval, limit=limit),
         columns=['open_time','open','high','low','close','volume','close_time',
@@ -82,15 +82,14 @@ def place_order(order_type):
     if target_hit or in_position: return
     side='buy' if 'buy' in order_type else 'sell'
 
-    # Cancel previous opposite order
     if pending_order_id and pending_order_side!=side:
         try: client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
         except: pass
-        send_telegram("⚠ Cancelled previous pending order (opposite signal)")
+        send_telegram("⚠ *Canceled previous pending order* (opposite signal)")
         pending_order_id=None
 
-    ob = client_live.futures_order_book(symbol=SYMBOL)
-    ask,bid = float(ob['asks'][0][0]), float(ob['bids'][0][0])
+    ob=client_live.futures_order_book(symbol=SYMBOL)
+    ask,bid=float(ob['asks'][0][0]),float(ob['bids'][0][0])
     if ask-bid>SPREAD_THRESHOLD: return
     stop=round(ask+ENTRY_BUFFER,2) if 'buy' in order_type else round(bid-ENTRY_BUFFER,2)
     df_1h, df_5m = add_indicators(get_klines('1h')), add_indicators(get_klines('5m'))
@@ -103,19 +102,19 @@ def place_order(order_type):
         type=FUTURE_ORDER_TYPE_STOP_MARKET, stopPrice=stop, quantity=TRADE_QUANTITY)
     pending_order_id, pending_order_side, pending_order_time = res['orderId'], side, datetime.utcnow()
 
-    send_telegram(f"🟩 STOP ORDER placed `{order_type.upper()}` at {stop} | SL:{sl_price} TP:{tp_price}")
+    send_telegram(f"🟩 *STOP ORDER PLACED*\n*Type:* `{order_type.upper()}`\n*Price:* `{stop}`\n*SL:* `{sl_price}` | *TP:* `{tp_price}`\n📍 Pending *({trade_direction})*")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price, f"Pending({trade_direction})"])
 
-# 🛑 Cancel pending >10min
+# 🛑 Cancel if pending >10min
 def cancel_pending_if_needed():
     global pending_order_id, pending_order_time
     if pending_order_id and pending_order_time and datetime.utcnow()-pending_order_time>timedelta(minutes=10):
         try: client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
         except: pass
-        send_telegram("🕒 Cancelled pending order (10 min expired)")
-        pending_order_id, pending_order_time = None, None
+        send_telegram("🕒 *Pending order canceled after 10 minutes*")
+        pending_order_id,pending_order_time=None,None
 
-# 🔄 Manage trade & trailing stop (untouched)
+# 🔄 Manage trade
 def manage_trade():
     global in_position,trailing_peak,current_trail_percent
     price=float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
@@ -144,7 +143,7 @@ def close_position(exit_price,reason):
     pnl=round((exit_price-entry_price) if trade_direction=='long' else (entry_price-exit_price),2)
     daily_trades.append((pnl,pnl>0))
     if sum(p for p,_ in daily_trades)>=DAILY_TARGET: target_hit=True
-    send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL:{pnl}")
+    send_telegram(f"❌ *Closed at:* `{exit_price}`\n*Reason:* {reason}\n*PnL:* `{pnl}`")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close({trade_direction})", entry_price, sl_price, tp_price, f"{reason},PnL:{pnl}"])
     in_position=False
 
@@ -160,7 +159,7 @@ def bot_loop():
                     if order['status']=='FILLED':
                         entry_price=float(order.get('avgFillPrice') or order.get('stopPrice'))
                         in_position,trailing_peak,current_trail_percent=True,entry_price,0.0
-                        send_telegram(f"✅ STOP triggered at {entry_price}")
+                        send_telegram(f"✅ *STOP order triggered*\n*Entry Price:* `{entry_price}`\n*Direction:* `{trade_direction}`")
                         log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"Triggered({trade_direction})", entry_price, sl_price, tp_price, "Opened"])
                         pending_order_id,pending_order_time=None,None
                 else:
@@ -170,16 +169,7 @@ def bot_loop():
         except: pass
         time.sleep(120)
 
-# 🕒 Daily summary
-def daily_scheduler():
-    global daily_trades,target_hit
-    while True:
-        now=datetime.utcnow()+timedelta(hours=1)
-        next_midnight=(now+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)
-        time.sleep((next_midnight-now).total_seconds())
-        daily_trades.clear(); target_hit=False
-
-# 🌐 Flask
+# 🌐 Flask & daily reset
 app=Flask(__name__)
 @app.route('/')
 def home(): return "🚀 Live bot running!"
@@ -187,5 +177,5 @@ def home(): return "🚀 Live bot running!"
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))
     threading.Thread(target=bot_loop,daemon=True).start()
-    threading.Thread(target=daily_scheduler,daemon=True).start()
+    threading.Thread(target=lambda: (time.sleep((datetime.utcnow()+timedelta(hours=1)+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)-datetime.utcnow()).total_seconds(), daily_trades.clear(), target_hit:=False),daemon=True).start()
     app.run(host="0.0.0.0",port=port)

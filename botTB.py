@@ -40,10 +40,8 @@ def get_gsheet_client():
     creds = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
     scope=['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
     return gspread.authorize(ServiceAccountCredentials.from_json_keyfile_dict(creds,scope))
-
 def log_trade_to_sheet(data):
-    try:
-        get_gsheet_client().open_by_key(GSHEET_ID).sheet1.append_row(data)
+    try: get_gsheet_client().open_by_key(GSHEET_ID).sheet1.append_row(data)
     except: pass
 
 # 📊 Data & indicators
@@ -61,7 +59,7 @@ def add_indicators(df):
     df['bb_mid'],df['bb_high'],df['bb_low']=bb.bollinger_mavg(),bb.bollinger_hband(),bb.bollinger_lband()
     return df
 
-# 📊 Signal logic
+# 📊 Signal logic — uses *live* forming candles
 def check_signal():
     if target_hit: return None
     df_5m, df_1h = add_indicators(get_klines('5m')), add_indicators(get_klines('1h'))
@@ -70,9 +68,14 @@ def check_signal():
     if now.minute >= 50: return None
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI: return None
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']: return None
+
+    # ✅ Trend: both current 5m & 1h forming candles bullish → trend_buy
     if c5['close']>c5['bb_mid'] and c5['close']<c5['bb_high'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'trend_buy'
+    # ✅ Trend: both bearish → trend_sell
     if c5['close']<c5['bb_mid'] and c5['close']>c5['bb_low'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'trend_sell'
+    # ✅ Reversal: c5 bullish, c1h bullish
     if c5['close']<c5['bb_mid'] and c5['close']>c5['bb_low'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'reversal_buy'
+    # ✅ Reversal: c5 bearish, c1h bearish
     if c5['close']>c5['bb_mid'] and c5['close']<c5['bb_high'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'reversal_sell'
     return None
 

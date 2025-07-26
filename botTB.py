@@ -131,7 +131,6 @@ def place_order(order_type):
     if pending_order_id and pending_order_side != new_side:
         try:
             client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
-            send_telegram("⚠ Canceled previous pending (new opposite signal)")
         except:
             pass
         pending_order_id = None
@@ -141,7 +140,6 @@ def place_order(order_type):
     bid = float(order_book['bids'][0][0])
     spread = ask - bid
     if spread > SPREAD_THRESHOLD:
-        send_telegram(f"⚠ Spread too wide (${spread:.2f}), skipping trade.")
         return
 
     df_1h = add_indicators(get_klines('1h'))
@@ -162,7 +160,6 @@ def place_order(order_type):
     pending_order_side = new_side
     pending_order_time = datetime.utcnow()
 
-    send_telegram(f"🟩 STOP_MARKET {order_type.upper()} at {stop_price} (+buffer)\nSL: {sl_price} | TP: {tp_price}")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, stop_price, sl_price, tp_price, f"Pending ({trade_direction})"])
 
 # 🛑 Cancel if pending >10min
@@ -172,17 +169,19 @@ def cancel_pending_if_needed():
         if datetime.utcnow() - pending_order_time > timedelta(minutes=10):
             try:
                 client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
-                send_telegram("🕒 Pending stop order canceled after 10 minutes")
             except:
                 pass
             pending_order_id = None
             pending_order_time = None
 
-# 🔄 Manage trade (unchanged)
+# 🔄 Manage trade (✅ fixed trailing stop)
 def manage_trade():
     global in_position, trailing_peak, current_trail_percent
     price = float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
-    profit_pct = abs((price - entry_price) / entry_price) if entry_price else 0
+    if not entry_price:
+        return
+
+    profit_pct = abs((price - entry_price) / entry_price)
 
     if profit_pct >= 0.03:
         current_trail_percent = 0.015
@@ -191,12 +190,17 @@ def manage_trade():
     elif profit_pct >= 0.01:
         current_trail_percent = 0.005
 
+    # Update trailing_peak only in favorable direction
+    if trade_direction == 'long' and price > trailing_peak:
+        trailing_peak = price
+    elif trade_direction == 'short' and price < trailing_peak:
+        trailing_peak = price
+
     if current_trail_percent > 0:
-        trailing_peak = max(trailing_peak, price) if trade_direction == 'long' else min(trailing_peak, price)
-        if trade_direction == 'long' and price < trailing_peak * (1 - current_trail_percent):
+        if trade_direction == 'long' and price <= trailing_peak * (1 - current_trail_percent):
             close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
             return
-        elif trade_direction == 'short' and price > trailing_peak * (1 + current_trail_percent):
+        elif trade_direction == 'short' and price >= trailing_peak * (1 + current_trail_percent):
             close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
             return
 
@@ -221,30 +225,12 @@ def close_position(exit_price, reason):
     if sum(p for p, _ in daily_trades) >= DAILY_TARGET:
         target_hit = True
 
-    send_telegram(f"❌ Closed at {exit_price} ({reason}) | PnL: {pnl}")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close ({trade_direction})", entry_price, sl_price, tp_price, f"{reason}, PnL: {pnl}"])
     in_position = False
 
 # 📊 Daily summary
 def send_daily_summary():
     global daily_trades, target_hit
-    if not daily_trades:
-        send_telegram("📊 Yesterday Summary:\nNo trades.")
-    else:
-        total_pnl = sum(p for p, _ in daily_trades)
-        win_rate = (sum(1 for _, win in daily_trades if win) / len(daily_trades)) * 100 if daily_trades else 0
-        biggest_win = max((p for p, _ in daily_trades if p > 0), default=0)
-        biggest_loss = min((p for p, _ in daily_trades if p < 0), default=0)
-        msg = (
-            f"📊 *Yesterday Summary* (WAT)\n"
-            f"Total trades: {len(daily_trades)}\n"
-            f"Win rate: {win_rate:.1f}%\n"
-            f"Total PnL: {total_pnl:.2f}\n"
-            f"Biggest win: {biggest_win}\n"
-            f"Biggest loss: {biggest_loss}\n"
-            f"{'🎯 Daily target hit ✅' if target_hit else '🎯 Daily target not reached ❌'}"
-        )
-        send_telegram(msg)
     daily_trades.clear()
     target_hit = False
 
@@ -263,7 +249,6 @@ def bot_loop():
                             in_position = True
                             trailing_peak = entry_price
                             current_trail_percent = 0.0
-                            send_telegram(f"✅ STOP order triggered at {entry_price}")
                             log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"Triggered ({trade_direction})", entry_price, sl_price, tp_price, "Opened"])
                             pending_order_id = None
                             pending_order_time = None

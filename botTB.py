@@ -59,7 +59,7 @@ def add_indicators(df):
     df['bb_mid'],df['bb_high'],df['bb_low']=bb.bollinger_mavg(),bb.bollinger_hband(),bb.bollinger_lband()
     return df
 
-# 📊 Signal logic — uses live forming candles
+# 📊 Signal logic (live forming candles)
 def check_signal():
     if target_hit: return None
     df_5m, df_1h = add_indicators(get_klines('5m')), add_indicators(get_klines('1h'))
@@ -68,13 +68,14 @@ def check_signal():
     if now.minute >= 50: return None
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI: return None
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']: return None
+
     if c5['close']>c5['bb_mid'] and c5['close']<c5['bb_high'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'trend_buy'
     if c5['close']<c5['bb_mid'] and c5['close']>c5['bb_low'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'trend_sell'
     if c5['close']<c5['bb_mid'] and c5['close']>c5['bb_low'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'reversal_buy'
     if c5['close']>c5['bb_mid'] and c5['close']<c5['bb_high'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'reversal_sell'
     return None
 
-# 🛠 Place stop order
+# 🛠 Place stop order (TP ≈ 100 pips above/below BB line)
 def place_order(order_type):
     global pending_order_id, pending_order_side, pending_order_time, sl_price, tp_price, trade_direction
     if target_hit or in_position: return
@@ -93,7 +94,8 @@ def place_order(order_type):
     df_1h, df_5m = add_indicators(get_klines('1h')), add_indicators(get_klines('5m'))
     c1h,c5 = df_1h.iloc[-1], df_5m.iloc[-1]
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
-    tp_price = max(stop, c5['bb_high']) if 'buy' in order_type else min(stop, c5['bb_low'])
+    bb_tp = c5['bb_high'] if 'buy' in order_type else c5['bb_low']
+    tp_price = round(bb_tp + 100 if 'buy' in order_type else bb_tp - 100, 2)
     trade_direction = 'long' if 'buy' in order_type else 'short'
 
     res=client_testnet.futures_create_order(symbol=SYMBOL, side=SIDE_BUY if 'buy' in order_type else SIDE_SELL,
@@ -112,7 +114,7 @@ def cancel_pending_if_needed():
         send_telegram("🕒 *Pending order canceled after 10 minutes*")
         pending_order_id,pending_order_time=None,None
 
-# 🔄 Manage trade
+# 🔄 Manage trade (unchanged)
 def manage_trade():
     global in_position,trailing_peak,current_trail_percent
     price=float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
@@ -147,22 +149,19 @@ def close_position(exit_price,reason):
 
 # 📊 Daily summary
 def send_daily_summary():
-    global target_hit
     if not daily_trades:
-        send_telegram("📊 *Yesterday Summary:*\n_No trades._")
+        send_telegram("📊 *Daily Summary:*\n_No trades today._")
         return
-    total_pnl = sum(p for p, _ in daily_trades)
-    num_wins = sum(1 for _, win in daily_trades if win)
-    msg = f"""📊 *Yesterday Summary*
+    total_pnl = sum(p for p,_ in daily_trades)
+    num_wins = sum(1 for _,w in daily_trades if w)
+    msg = f"""📊 *Daily Summary*
 Total Trades: *{len(daily_trades)}*
 Win Rate: *{(num_wins/len(daily_trades))*100:.1f}%*
 Total PnL: *{total_pnl:.2f}*
-Biggest Win: *{max((p for p,_ in daily_trades if p>0), default=0)}*
-Biggest Loss: *{min((p for p,_ in daily_trades if p<0), default=0)}*
+Biggest Win: *{max((p for p,_ in daily_trades if p>0),default=0)}*
+Biggest Loss: *{min((p for p,_ in daily_trades if p<0),default=0)}*
 {'🎯 *Target hit ✅*' if target_hit else '🎯 *Target not reached ❌*'}"""
     send_telegram(msg)
-    daily_trades.clear()
-    target_hit = False
 
 # 🚀 Bot loop
 def bot_loop():
@@ -186,21 +185,21 @@ def bot_loop():
         except: pass
         time.sleep(120)
 
-# 🕒 Daily scheduler
-def daily_scheduler():
-    while True:
-        now = datetime.utcnow() + timedelta(hours=1)
-        next_midnight = (now + timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)
-        time.sleep((next_midnight - now).total_seconds())
-        send_daily_summary()
-
-# 🌐 Flask
+# 🌐 Flask & daily summary
 app=Flask(__name__)
 @app.route('/')
 def home(): return "🚀 Live bot running!"
 
+def daily_report_loop():
+    while True:
+        now=datetime.utcnow()+timedelta(hours=1)
+        next_midnight=(now+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)
+        time.sleep((next_midnight-now).total_seconds())
+        send_daily_summary()
+        daily_trades.clear()
+
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))
     threading.Thread(target=bot_loop,daemon=True).start()
-    threading.Thread(target=daily_scheduler,daemon=True).start()
+    threading.Thread(target=daily_report_loop,daemon=True).start()
     app.run(host="0.0.0.0",port=port)

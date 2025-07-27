@@ -150,11 +150,11 @@ def close_position(exit_price,reason):
 # 📊 Daily summary
 def send_daily_summary():
     if not daily_trades:
-        send_telegram("📊 *Daily Summary:*\n_No trades today._")
+        send_telegram("📊 *Yesterday's Summary:*\n_No trades today._")
         return
     total_pnl = sum(p for p,_ in daily_trades)
     num_wins = sum(1 for _,w in daily_trades if w)
-    msg = f"""📊 *Daily Summary*
+    msg = f"""📊 *Yesterday's Summary*
 Total Trades: *{len(daily_trades)}*
 Win Rate: *{(num_wins/len(daily_trades))*100:.1f}%*
 Total PnL: *{total_pnl:.2f}*

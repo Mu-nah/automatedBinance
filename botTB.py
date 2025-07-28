@@ -25,7 +25,7 @@ client_live = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 # ✅ State
 in_position, pending_order_id, pending_order_side, pending_order_time = False, None, None, None
-entry_price, sl_price, tp_price, trailing_peak, current_trail_percent = None, None, None, None, 0.0
+entry_price, sl_price, tp_price, trailing_peak, trailing_stop_price, current_trail_percent = None, None, None, None, None, 0.0
 trade_direction, daily_trades, target_hit = None, deque(), False
 
 # 📩 Telegram
@@ -114,20 +114,36 @@ def cancel_pending_if_needed():
         send_telegram("🕒 *Pending order canceled after 10 minutes*")
         pending_order_id,pending_order_time=None,None
 
-# 🔄 Manage trade (unchanged)
+# 🔄 Manage trade (proper trailing stop)
 def manage_trade():
-    global in_position,trailing_peak,current_trail_percent
+    global in_position,trailing_peak,trailing_stop_price,current_trail_percent
     price=float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
     if not entry_price: return
+
     profit_pct=abs((price-entry_price)/entry_price)
     if profit_pct>=0.03: current_trail_percent=0.015
     elif profit_pct>=0.02: current_trail_percent=0.01
     elif profit_pct>=0.01: current_trail_percent=0.005
-    if trade_direction=='long' and price>trailing_peak: trailing_peak=price
-    elif trade_direction=='short' and price<trailing_peak: trailing_peak=price
-    if current_trail_percent>0:
-        if trade_direction=='long' and price<=trailing_peak*(1-current_trail_percent): close_position(price,"Trailing Stop Hit")
-        elif trade_direction=='short' and price>=trailing_peak*(1+current_trail_percent): close_position(price,"Trailing Stop Hit")
+
+    if trade_direction=='long':
+        if trailing_peak is None or price>trailing_peak:
+            trailing_peak=price
+            trailing_stop_price = price*(1-current_trail_percent)
+        elif price > trailing_stop_price/(1-current_trail_percent):
+            trailing_stop_price = price*(1-current_trail_percent)
+        if current_trail_percent>0 and price<=trailing_stop_price:
+            close_position(price,f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
+            return
+    else:
+        if trailing_peak is None or price<trailing_peak:
+            trailing_peak=price
+            trailing_stop_price = price*(1+current_trail_percent)
+        elif price < trailing_stop_price/(1+current_trail_percent):
+            trailing_stop_price = price*(1+current_trail_percent)
+        if current_trail_percent>0 and price>=trailing_stop_price:
+            close_position(price,f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
+            return
+
     if trade_direction=='long':
         if price<=sl_price: close_position(price,"Stop Loss Hit")
         elif price>=tp_price: close_position(price,"Take Profit Hit")
@@ -165,7 +181,7 @@ Biggest Loss: *{min((p for p,_ in daily_trades if p<0),default=0)}*
 
 # 🚀 Bot loop
 def bot_loop():
-    global in_position,pending_order_id,entry_price,trailing_peak,current_trail_percent
+    global in_position,pending_order_id,entry_price,trailing_peak,trailing_stop_price,current_trail_percent
     while True:
         try:
             if not in_position:
@@ -174,7 +190,7 @@ def bot_loop():
                     order=client_testnet.futures_get_order(symbol=SYMBOL,orderId=pending_order_id)
                     if order['status']=='FILLED':
                         entry_price=float(order.get('avgFillPrice') or order.get('stopPrice'))
-                        in_position,trailing_peak,current_trail_percent=True,entry_price,0.0
+                        in_position,trailing_peak,trailing_stop_price,current_trail_percent=True,entry_price,None,0.0
                         send_telegram(f"✅ *STOP order triggered*\n*Entry Price:* `{entry_price}`\n*Direction:* `{trade_direction}`")
                         log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"Triggered({trade_direction})", entry_price, sl_price, tp_price, "Opened"])
                         pending_order_id,pending_order_time=None,None

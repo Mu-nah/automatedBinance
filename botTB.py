@@ -207,12 +207,15 @@ app=Flask(__name__)
 def home(): return "🚀 Live bot running!"
 
 def daily_report_loop():
+    global target_hit
     while True:
-        now=datetime.utcnow()+timedelta(hours=1)
-        next_midnight=(now+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)
-        time.sleep((next_midnight-now).total_seconds())
+        now = datetime.utcnow() + timedelta(hours=1)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        time.sleep((next_midnight - now).total_seconds())
         send_daily_summary()
         daily_trades.clear()
+        target_hit = False
+
 
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))

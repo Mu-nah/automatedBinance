@@ -59,7 +59,7 @@ def add_indicators(df):
     df['bb_mid'],df['bb_high'],df['bb_low']=bb.bollinger_mavg(),bb.bollinger_hband(),bb.bollinger_lband()
     return df
 
-# 📊 Signal logic (live forming candles)
+# 📊 Signal logic
 def check_signal():
     if target_hit: return None
     df_5m, df_1h = add_indicators(get_klines('5m')), add_indicators(get_klines('1h'))
@@ -68,14 +68,13 @@ def check_signal():
     if now.minute >= 50: return None
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI: return None
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']: return None
-
-    if c5['close']>c5['bb_mid'] and c5['close']<c5['bb_high'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'trend_buy'
-    if c5['close']<c5['bb_mid'] and c5['close']>c5['bb_low'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'trend_sell'
-    if c5['close']<c5['bb_mid'] and c5['close']>c5['bb_low'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'reversal_buy'
-    if c5['close']>c5['bb_mid'] and c5['close']<c5['bb_high'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'reversal_sell'
+    if c5['close']>c5['bb_mid'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'trend_buy'
+    if c5['close']<c5['bb_mid'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'trend_sell'
+    if c5['close']<c5['bb_mid'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'reversal_buy'
+    if c5['close']>c5['bb_mid'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'reversal_sell'
     return None
 
-# 🛠 Place stop order (TP ≈ 100 pips above/below BB line)
+# 🛠 Place stop order
 def place_order(order_type):
     global pending_order_id, pending_order_side, pending_order_time, sl_price, tp_price, trade_direction
     if target_hit or in_position: return
@@ -105,22 +104,12 @@ def place_order(order_type):
     send_telegram(f"🟩 *STOP ORDER PLACED*\n*Type:* `{order_type.upper()}`\n*Price:* `{stop}`\n*SL:* `{sl_price}` | *TP:* `{tp_price}`\n📍 Pending *({trade_direction})*")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price, f"Pending({trade_direction})"])
 
-# 🛑 Cancel if pending >10min
-def cancel_pending_if_needed():
-    global pending_order_id, pending_order_time
-    if pending_order_id and pending_order_time and datetime.utcnow()-pending_order_time>timedelta(minutes=10):
-        try: client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
-        except: pass
-        send_telegram("🕒 *Pending order canceled after 10 minutes*")
-        pending_order_id,pending_order_time=None,None
-
-# 🔄 Manage trade (proper trailing stop)
+# 🔄 Manage trade with proper trailing stop
 def manage_trade():
-    global in_position,trailing_peak,trailing_stop_price,current_trail_percent
+    global trailing_peak, trailing_stop_price, current_trail_percent, in_position
     price=float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
     if not entry_price: return
-
-    profit_pct=abs((price-entry_price)/entry_price)
+    profit_pct=(price-entry_price)/entry_price if trade_direction=='long' else (entry_price - price)/entry_price
     if profit_pct>=0.03: current_trail_percent=0.015
     elif profit_pct>=0.02: current_trail_percent=0.01
     elif profit_pct>=0.01: current_trail_percent=0.005
@@ -128,28 +117,21 @@ def manage_trade():
     if trade_direction=='long':
         if trailing_peak is None or price>trailing_peak:
             trailing_peak=price
-            trailing_stop_price = price*(1-current_trail_percent)
-        elif price > trailing_stop_price/(1-current_trail_percent):
-            trailing_stop_price = price*(1-current_trail_percent)
+            trailing_stop_price=trailing_peak*(1-current_trail_percent)
         if current_trail_percent>0 and price<=trailing_stop_price:
             close_position(price,f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
             return
+        if price>=tp_price: close_position(price,"Take Profit Hit"); return
+        if price<=sl_price: close_position(price,"Stop Loss Hit"); return
     else:
         if trailing_peak is None or price<trailing_peak:
             trailing_peak=price
-            trailing_stop_price = price*(1+current_trail_percent)
-        elif price < trailing_stop_price/(1+current_trail_percent):
-            trailing_stop_price = price*(1+current_trail_percent)
+            trailing_stop_price=trailing_peak*(1+current_trail_percent)
         if current_trail_percent>0 and price>=trailing_stop_price:
             close_position(price,f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
             return
-
-    if trade_direction=='long':
-        if price<=sl_price: close_position(price,"Stop Loss Hit")
-        elif price>=tp_price: close_position(price,"Take Profit Hit")
-    else:
-        if price>=sl_price: close_position(price,"Stop Loss Hit")
-        elif price<=tp_price: close_position(price,"Take Profit Hit")
+        if price<=tp_price: close_position(price,"Take Profit Hit"); return
+        if price>=sl_price: close_position(price,"Stop Loss Hit"); return
 
 # ❌ Close trade
 def close_position(exit_price,reason):
@@ -163,34 +145,20 @@ def close_position(exit_price,reason):
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close({trade_direction})", entry_price, sl_price, tp_price, f"{reason},PnL:{pnl}"])
     in_position=False
 
-# 📊 Daily summary
-def send_daily_summary():
-    if not daily_trades:
-        send_telegram("📊 *Yesterday's Summary:*\n_No trades today._")
-        return
-    total_pnl = sum(p for p,_ in daily_trades)
-    num_wins = sum(1 for _,w in daily_trades if w)
-    msg = f"""📊 *Yesterday's Summary*
-Total Trades: *{len(daily_trades)}*
-Win Rate: *{(num_wins/len(daily_trades))*100:.1f}%*
-Total PnL: *{total_pnl:.2f}*
-Biggest Win: *{max((p for p,_ in daily_trades if p>0),default=0)}*
-Biggest Loss: *{min((p for p,_ in daily_trades if p<0),default=0)}*
-{'🎯 *Target hit ✅*' if target_hit else '🎯 *Target not reached ❌*'}"""
-    send_telegram(msg)
-
 # 🚀 Bot loop
 def bot_loop():
     global in_position,pending_order_id,entry_price,trailing_peak,trailing_stop_price,current_trail_percent
     while True:
         try:
             if not in_position:
-                cancel_pending_if_needed()
                 if pending_order_id:
                     order=client_testnet.futures_get_order(symbol=SYMBOL,orderId=pending_order_id)
                     if order['status']=='FILLED':
                         entry_price=float(order.get('avgFillPrice') or order.get('stopPrice'))
-                        in_position,trailing_peak,trailing_stop_price,current_trail_percent=True,entry_price,None,0.0
+                        trailing_peak=entry_price
+                        trailing_stop_price=None
+                        current_trail_percent=0.0
+                        in_position=True
                         send_telegram(f"✅ *STOP order triggered*\n*Entry Price:* `{entry_price}`\n*Direction:* `{trade_direction}`")
                         log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"Triggered({trade_direction})", entry_price, sl_price, tp_price, "Opened"])
                         pending_order_id,pending_order_time=None,None
@@ -201,21 +169,22 @@ def bot_loop():
         except: pass
         time.sleep(120)
 
-# 🌐 Flask & daily summary
-app=Flask(__name__)
-@app.route('/')
-def home(): return "🚀 Live bot running!"
-
+# 📊 Daily summary
 def daily_report_loop():
     global target_hit
     while True:
         now = datetime.utcnow() + timedelta(hours=1)
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
-        send_daily_summary()
+        total_pnl = sum(p for p,_ in daily_trades)
+        send_telegram(f"📊 *Daily Summary*\nTrades: {len(daily_trades)}\nPnL: {total_pnl:.2f}")
         daily_trades.clear()
-        target_hit = False
+        target_hit=False
 
+# 🌐 Flask
+app=Flask(__name__)
+@app.route('/')
+def home(): return "🚀 Bot running!"
 
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))

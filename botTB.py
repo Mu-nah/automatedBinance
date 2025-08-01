@@ -15,6 +15,7 @@ load_dotenv()
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 17, 1000
+DAILY_LOSS_LIMIT = -700  # 🛡️ New: daily max loss
 RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
 TELEGRAM_TOKEN, CHAT_ID, GSHEET_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"), os.getenv("GSHEET_ID")
 
@@ -80,7 +81,7 @@ def check_signal():
     if c5['close']>c5['bb_mid'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'reversal_sell'
     return None
 
-# 🛠 Place stop order (TP = 100 pips *beyond* BB line)
+# 🛠 Place stop order
 def place_order(order_type):
     global pending_order_id, pending_order_side, pending_order_time, sl_price, tp_price, trade_direction
     if target_hit or in_position: return
@@ -101,7 +102,7 @@ def place_order(order_type):
     c1h, c5 = df_1h.iloc[-1], df_5m.iloc[-1]
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
     bb_tp = c5['bb_high'] if 'buy' in order_type else c5['bb_low']
-    tp_price = round(bb_tp + 100 if 'buy' in order_type else bb_tp - 100, 2)  # ✅ beyond BB
+    tp_price = round(bb_tp + 100 if 'buy' in order_type else bb_tp - 100, 2)
     trade_direction = 'long' if 'buy' in order_type else 'short'
 
     res = client_testnet.futures_create_order(symbol=SYMBOL, side=SIDE_BUY if 'buy' in order_type else SIDE_SELL,
@@ -111,7 +112,7 @@ def place_order(order_type):
     send_telegram(f"🟩 *STOP ORDER PLACED*\n*Type:* `{order_type.upper()}`\n*Price:* `{stop}`\n*SL:* `{sl_price}` | *TP:* `{tp_price}`\n📍 Pending *({trade_direction})*")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price, f"Pending({trade_direction})"])
 
-# 🔄 Manage trade (fixed trailing stop)
+# 🔄 Manage trade
 def manage_trade():
     global trailing_peak, trailing_stop_price, current_trail_percent
     price = float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
@@ -154,7 +155,8 @@ def close_position(exit_price, reason):
     daily_trades.append((pnl, pnl > 0))
     if "Take Profit" in reason:
         last_tp_hit_time = datetime.utcnow()
-    if sum(p for p,_ in daily_trades) >= DAILY_TARGET:
+    total_pnl = sum(p for p,_ in daily_trades)
+    if total_pnl >= DAILY_TARGET or total_pnl <= DAILY_LOSS_LIMIT:
         target_hit = True
     send_telegram(f"❌ *Closed at:* `{exit_price}`\n*Reason:* {reason}\n*PnL:* `{pnl}`")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close({trade_direction})", entry_price, sl_price, tp_price, f"{reason},PnL:{pnl}"])

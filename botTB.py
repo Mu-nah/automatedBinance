@@ -1,3 +1,4 @@
+# 🚀 START OF FULL BOT CODE
 import os, time, json
 from datetime import datetime, timedelta, timezone
 import pandas as pd, threading
@@ -15,7 +16,7 @@ load_dotenv()
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 0.5, 1000
-DAILY_LOSS_LIMIT = -700  # 🛡️ New: daily max loss
+DAILY_LOSS_LIMIT = -700
 RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
 TELEGRAM_TOKEN, CHAT_ID, GSHEET_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"), os.getenv("GSHEET_ID")
 
@@ -28,7 +29,7 @@ client_live = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 in_position, pending_order_id, pending_order_side, pending_order_time = False, None, None, None
 entry_price, sl_price, tp_price, trailing_peak, trailing_stop_price, current_trail_percent = None, None, None, None, None, 0.0
 trade_direction, daily_trades, target_hit = None, deque(), False
-last_tp_hit_time = None  # 🕒 cooldown after TP
+last_tp_hit_time = None
 
 # 📩 Telegram
 def send_telegram(msg):
@@ -101,8 +102,14 @@ def place_order(order_type):
     df_1h, df_5m = add_indicators(get_klines('1h')), add_indicators(get_klines('5m'))
     c1h, c5 = df_1h.iloc[-1], df_5m.iloc[-1]
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
-    bb_tp = c5['bb_high'] if 'buy' in order_type else c5['bb_low']
-    tp_price = round(bb_tp + 100 if 'buy' in order_type else bb_tp - 100, 2)
+
+    if 'reversal' in order_type:
+        bb_mid = c5['bb_mid']
+        tp_price = round(bb_mid + 100 if 'buy' in order_type else bb_mid - 100, 2)
+    else:
+        bb_tp = c5['bb_high'] if 'buy' in order_type else c5['bb_low']
+        tp_price = round(bb_tp + 100 if 'buy' in order_type else bb_tp - 100, 2)
+
     trade_direction = 'long' if 'buy' in order_type else 'short'
 
     res = client_testnet.futures_create_order(symbol=SYMBOL, side=SIDE_BUY if 'buy' in order_type else SIDE_SELL,
@@ -162,6 +169,18 @@ def close_position(exit_price, reason):
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close({trade_direction})", entry_price, sl_price, tp_price, f"{reason},PnL:{pnl}"])
     in_position = False
 
+# ⏱ Cancel untriggered stop orders after 10 minutes
+def cancel_expired_order():
+    global pending_order_id, pending_order_time
+    if pending_order_id and pending_order_time:
+        age = datetime.utcnow() - pending_order_time
+        if age.total_seconds() > 600:
+            try:
+                client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
+                send_telegram("⌛ *Pending stop order canceled after 10 minutes*")
+            except: pass
+            pending_order_id, pending_order_time = None, None
+
 # 🚀 Bot loop
 def bot_loop():
     global in_position, pending_order_id, entry_price, trailing_peak, trailing_stop_price, current_trail_percent
@@ -176,18 +195,21 @@ def bot_loop():
                         send_telegram(f"✅ *STOP order triggered*\n*Entry Price:* `{entry_price}`\n*Direction:* `{trade_direction}`")
                         log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"Triggered({trade_direction})", entry_price, sl_price, tp_price, "Opened"])
                         pending_order_id, pending_order_time = None, None
+                    else:
+                        cancel_expired_order()
                 else:
                     s = check_signal()
                     if s: place_order(s)
             else:
                 manage_trade()
-        except: pass
+        except Exception as e:
+            print("Error in loop:", e)
         time.sleep(120)
 
-# 🌐 Flask & daily summary
+# 🌐 Flask & daily report
 app = Flask(__name__)
 @app.route('/')
-def home(): return "🚀 Live bot running!"
+def home(): return "🚀 Bot is live."
 
 def daily_report_loop():
     global target_hit
@@ -195,7 +217,6 @@ def daily_report_loop():
         now = datetime.utcnow() + timedelta(hours=1)
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
-
         total_trades = len(daily_trades)
         total_pnl = sum(p for p, _ in daily_trades)
         num_wins = sum(1 for _, win in daily_trades if win)
@@ -215,7 +236,7 @@ Biggest Loss: {biggest_loss}
         daily_trades.clear()
         target_hit = False
 
-if __name__=="__main__":
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     threading.Thread(target=bot_loop, daemon=True).start()
     threading.Thread(target=daily_report_loop, daemon=True).start()

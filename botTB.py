@@ -101,14 +101,8 @@ def place_order(order_type):
     df_1h, df_5m = add_indicators(get_klines('1h')), add_indicators(get_klines('5m'))
     c1h, c5 = df_1h.iloc[-1], df_5m.iloc[-1]
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
-
-    if 'reversal' in order_type:
-        bb_mid = c5['bb_mid']
-        tp_price = round(bb_mid + 100 if 'buy' in order_type else bb_mid - 100, 2)
-    else:
-        bb_tp = c5['bb_high'] if 'buy' in order_type else c5['bb_low']
-        tp_price = round(bb_tp + 100 if 'buy' in order_type else bb_tp - 100, 2)
-
+    bb_tp = c5['bb_high'] if 'buy' in order_type else c5['bb_low']
+    tp_price = round(bb_tp + 100 if 'buy' in order_type else bb_tp - 100, 2)
     trade_direction = 'long' if 'buy' in order_type else 'short'
 
     res = client_testnet.futures_create_order(symbol=SYMBOL, side=SIDE_BUY if 'buy' in order_type else SIDE_SELL,

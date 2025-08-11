@@ -30,6 +30,8 @@ in_position, pending_order_id, pending_order_side, pending_order_time = False, N
 entry_price, sl_price, tp_price, trailing_peak, trailing_stop_price, current_trail_percent = None, None, None, None, None, 0.0
 trade_direction, daily_trades, target_hit = None, deque(), False
 last_tp_hit_time = None
+recent_losses = deque(maxlen=4)  # 🆕 Track recent SL streak
+last_loss_pause_time = None      # 🆕 Pause timer after SL streak
 
 # 📩 Telegram
 def send_telegram(msg):
@@ -155,16 +157,29 @@ def manage_trade():
 
 # ❌ Close trade
 def close_position(exit_price, reason):
-    global in_position, target_hit, last_tp_hit_time
+    global in_position, target_hit, last_tp_hit_time, last_loss_pause_time
     side = SIDE_SELL if trade_direction == 'long' else SIDE_BUY
     client_testnet.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
     pnl = round((exit_price - entry_price) if trade_direction == 'long' else (entry_price - exit_price), 2)
-    daily_trades.append((pnl, pnl > 0))
+    is_win = pnl > 0
+    daily_trades.append((pnl, is_win))
+
+    # 🆕 Track SL streak
+    if "Stop Loss" in reason:
+        recent_losses.append("SL")
+        if len(recent_losses) == 4 and all(r == "SL" for r in recent_losses):
+            last_loss_pause_time = datetime.utcnow()
+            send_telegram("⏸ Bot pausing for 1 hour due to 4 consecutive Stop Losses.")
+    else:
+        recent_losses.clear()
+
     if "Take Profit" in reason:
         last_tp_hit_time = datetime.utcnow()
+
     total_pnl = sum(p for p,_ in daily_trades)
     if total_pnl >= DAILY_TARGET or total_pnl <= DAILY_LOSS_LIMIT:
         target_hit = True
+
     send_telegram(f"❌ *Closed at:* `{exit_price}`\n*Reason:* {reason}\n*PnL:* `{pnl}`")
     log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, f"close({trade_direction})", entry_price, sl_price, tp_price, f"{reason},PnL:{pnl}"])
     in_position = False
@@ -183,9 +198,17 @@ def cancel_expired_order():
 
 # 🚀 Bot loop
 def bot_loop():
-    global in_position, pending_order_id, entry_price, trailing_peak, trailing_stop_price, current_trail_percent
+    global in_position, pending_order_id, entry_price, trailing_peak, trailing_stop_price, current_trail_percent, last_loss_pause_time
     while True:
         try:
+            # 🆕 Pause for 1 hour after 4 SL in a row
+            if last_loss_pause_time:
+                if datetime.utcnow() - last_loss_pause_time < timedelta(hours=1):
+                    time.sleep(60)
+                    continue
+                else:
+                    last_loss_pause_time = None
+
             if not in_position:
                 if pending_order_id:
                     order = client_testnet.futures_get_order(symbol=SYMBOL, orderId=pending_order_id)

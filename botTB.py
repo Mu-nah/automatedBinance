@@ -15,7 +15,7 @@ load_dotenv()
 # ✅ Config
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 0.5, 1500
+SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 0.5, 1200
 DAILY_LOSS_LIMIT = -700
 RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
 TELEGRAM_TOKEN, CHAT_ID, GSHEET_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"), os.getenv("GSHEET_ID")
@@ -201,10 +201,10 @@ def bot_loop():
     global in_position, pending_order_id, entry_price, trailing_peak, trailing_stop_price, current_trail_percent, last_loss_pause_time
     while True:
         try:
-            # 🆕 Pause for 1 hour after 4 SL in a row
+            # 🆕 Pause for 30 mins after 4 SL in a row
             if last_loss_pause_time:
                 if datetime.utcnow() - last_loss_pause_time < timedelta(hours=1):
-                    time.sleep(60)
+                    time.sleep(30)
                     continue
                 else:
                     last_loss_pause_time = None

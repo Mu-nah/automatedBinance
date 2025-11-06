@@ -310,7 +310,7 @@ def bot_loop():
                             sentiment = check_sentiment()
                             threshold = 0.3
                             buy_ok = ('buy' in s) and (sentiment >= threshold)
-                            sell_ok = ('sell' in s) and (sentiment <= -threshold)
+                            sell_ok = ('sell' in s) and (sentiment < threshold)
                             if buy_ok or sell_ok:
                                 place_order(s, sentiment=sentiment)
                             else:

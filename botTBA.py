@@ -1,4 +1,4 @@
-# 🚀 START OF FULL BOT CODE (with ATR alert)
+# 🚀 START OF FULL BOT CODE (with ATR-based buffer + trend filter)
 import os, time, json
 from datetime import datetime, timedelta, timezone
 import pandas as pd, threading
@@ -17,7 +17,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 0.5, 1200
 DAILY_LOSS_LIMIT = -700
-RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
+RSI_LO, RSI_HI = 47, 53
 TELEGRAM_TOKEN, CHAT_ID, GSHEET_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"), os.getenv("GSHEET_ID")
 
 # ✅ Clients
@@ -69,7 +69,9 @@ def add_indicators(df):
     df['rsi'] = ta.momentum.rsi(df['close'],14)
     bb = ta.volatility.BollingerBands(df['close'],20,2)
     df['bb_mid'], df['bb_high'], df['bb_low'] = bb.bollinger_mavg(), bb.bollinger_hband(), bb.bollinger_lband()
-    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)  # 🆕 ATR added
+    df['ema50'] = ta.trend.ema_indicator(df['close'], 50)
+    df['ema200'] = ta.trend.ema_indicator(df['close'], 200)
+    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], 14)
     return df
 
 # 📊 Signal logic
@@ -78,16 +80,36 @@ def check_signal():
     if target_hit: return None
     if last_tp_hit_time and datetime.utcnow() - last_tp_hit_time < timedelta(minutes=30):
         return None
+
     df_5m, df_1h = add_indicators(get_klines('5m')), add_indicators(get_klines('1h'))
     c5, c1h = df_5m.iloc[-1], df_1h.iloc[-1]
     now = datetime.now(timezone.utc) + timedelta(hours=1)
     if now.minute >= 50: return None
+
+    # Skip flat RSI zones
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI: return None
+
+    # Skip extreme bands
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']: return None
-    if c5['close']>c5['bb_mid'] and c5['close']<c5['bb_high'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'trend_buy'
-    if c5['close']<c5['bb_mid'] and c5['close']>c5['bb_low'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'trend_sell'
-    if c5['close']<c5['bb_mid'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'reversal_buy'
-    if c5['close']>c5['bb_mid'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'reversal_sell'
+
+    # Determine trend
+    trend = "bull" if c1h['ema50'] > c1h['ema200'] else "bear"
+
+    # --- Trend Trades ---
+    if trend == "bull" and c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+        return 'trend_buy'
+    if trend == "bear" and c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+        return 'trend_sell'
+
+    # --- Reversal Trades (skip during strong trends) ---
+    ema_diff = abs(c1h['ema50'] - c1h['ema200']) / c1h['ema200']
+    if ema_diff > 0.01:  # strong trend, skip reversals
+        return None
+
+    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+        return 'reversal_buy'
+    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+        return 'reversal_sell'
     return None
 
 # 🛠 Place stop order
@@ -97,22 +119,23 @@ def place_order(order_type):
     side = 'buy' if 'buy' in order_type else 'sell'
 
     if pending_order_id and pending_order_side != side:
-        try:
-            client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
-        except:
-            pass
+        try: client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
+        except: pass
         send_telegram("⚠ *Canceled previous pending order* (opposite signal)")
         pending_order_id = None
 
     ob = client_live.futures_order_book(symbol=SYMBOL)
     ask, bid = float(ob['asks'][0][0]), float(ob['bids'][0][0])
-    if ask-bid > SPREAD_THRESHOLD: return
-    stop = round(ask+ENTRY_BUFFER,2) if 'buy' in order_type else round(bid-ENTRY_BUFFER,2)
+    if ask - bid > SPREAD_THRESHOLD: return
 
     df_1h, df_5m = add_indicators(get_klines('1h')), add_indicators(get_klines('5m'))
     c1h, c5 = df_1h.iloc[-1], df_5m.iloc[-1]
+    atr = c5['atr']
+
+    # ATR-based dynamic buffer
+    ENTRY_BUFFER = round(max(0.8, atr * 0.05), 2)
+    stop = round(ask + ENTRY_BUFFER, 2) if 'buy' in order_type else round(bid - ENTRY_BUFFER, 2)
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
-    atr_val = round(c5['atr'], 2)  # 🆕 ATR for alert
 
     if 'reversal' in order_type:
         bb_mid = c5['bb_mid']
@@ -133,18 +156,11 @@ def place_order(order_type):
     pending_order_id, pending_order_side, pending_order_time = res['orderId'], side, datetime.utcnow()
 
     send_telegram(
-        f"🟩 *STOP ORDER PLACED*\n"
-        f"*Type:* `{order_type.upper()}`\n"
-        f"*Price:* `{stop}`\n"
-        f"*SL:* `{sl_price}` | *TP:* `{tp_price}`\n"
-        f"📊 *ATR(14):* `{atr_val}`\n"
-        f"📍 Pending *({trade_direction})*"
+        f"🟩 *STOP ORDER PLACED*\n*Type:* `{order_type.upper()}`\n"
+        f"*Price:* `{stop}`\n*SL:* `{sl_price}` | *TP:* `{tp_price}`\n"
+        f"📊 *ATR(14):* `{atr:.2f}` | *Buffer:* `{ENTRY_BUFFER}`\n📍 Pending *({trade_direction})*"
     )
-
-    log_trade_to_sheet([
-        str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price,
-        f"Pending({trade_direction}) | ATR:{atr_val}"
-    ])
+    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price, f"Pending({trade_direction})"])
 
 # 🔄 Manage trade
 def manage_trade():
@@ -252,7 +268,7 @@ def bot_loop():
             print("Error in loop:", e)
         time.sleep(120)
 
-# 🌐 Flask + Daily report
+# 🌐 Flask & daily report
 app = Flask(__name__)
 @app.route('/')
 def home(): return "🚀 Bot is live."

@@ -6,7 +6,9 @@ ta
 gspread
 oauth2client
 python-binance==1.0.17
-torch
-transformers
-feedparser
-numpy
+# torch
+# transformers
+# feedparser
+# numpy
+
+

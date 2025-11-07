@@ -15,4 +15,4 @@ RUN pip install -r requirements.txt
 EXPOSE 5000
 
 # Run app
-CMD ["python", "botTBS.py"]
+CMD ["python", "botTBA.py"]

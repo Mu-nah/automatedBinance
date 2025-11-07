@@ -1,4 +1,4 @@
-# 🚀 START OF FULL BOT CODE (with EMA/ATR filters)
+# 🚀 START OF FULL BOT CODE (with ATR alert)
 import os, time, json
 from datetime import datetime, timedelta, timezone
 import pandas as pd, threading
@@ -18,9 +18,6 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 0.5, 1200
 DAILY_LOSS_LIMIT = -700
 RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
-ATR_FILTER = 20          # Minimum ATR value for volatility filter
-ATR_PERIOD = 14
-EMA_SHORT, EMA_LONG = 50, 200
 TELEGRAM_TOKEN, CHAT_ID, GSHEET_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"), os.getenv("GSHEET_ID")
 
 # ✅ Clients
@@ -39,8 +36,10 @@ last_loss_pause_time = None
 # 📩 Telegram
 def send_telegram(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+        )
     except:
         pass
 
@@ -63,75 +62,38 @@ def get_klines(interval='5m', limit=100):
                  'quote_asset_volume','number_of_trades','taker_buy_base','taker_buy_quote','ignore'])
     df['time'] = pd.to_datetime(df['open_time'], unit='ms')
     for col in ['open','high','low','close','volume']:
-        df[col] = df[col].astype(float)
+        df[col]=df[col].astype(float)
     return df
 
 def add_indicators(df):
-    df['rsi'] = ta.momentum.rsi(df['close'], 14)
-    bb = ta.volatility.BollingerBands(df['close'], 20, 2)
+    df['rsi'] = ta.momentum.rsi(df['close'],14)
+    bb = ta.volatility.BollingerBands(df['close'],20,2)
     df['bb_mid'], df['bb_high'], df['bb_low'] = bb.bollinger_mavg(), bb.bollinger_hband(), bb.bollinger_lband()
-    df['ema50'] = ta.trend.ema_indicator(df['close'], EMA_SHORT)
-    df['ema200'] = ta.trend.ema_indicator(df['close'], EMA_LONG)
-    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], ATR_PERIOD)
+    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)  # 🆕 ATR added
     return df
-
-# ⚙️ Detect RSI divergence (simple check)
-def rsi_divergence(df):
-    if len(df) < 3: return False
-    r1, r2, r3 = df['rsi'].iloc[-3], df['rsi'].iloc[-2], df['rsi'].iloc[-1]
-    p1, p2, p3 = df['close'].iloc[-3], df['close'].iloc[-2], df['close'].iloc[-1]
-    bull_div = (p3 < p2 < p1) and (r3 > r2 > r1)
-    bear_div = (p3 > p2 > p1) and (r3 < r2 < r1)
-    return bull_div or bear_div
 
 # 📊 Signal logic
 def check_signal():
     global last_tp_hit_time
-    if target_hit:
-        return None
+    if target_hit: return None
     if last_tp_hit_time and datetime.utcnow() - last_tp_hit_time < timedelta(minutes=30):
         return None
-
     df_5m, df_1h = add_indicators(get_klines('5m')), add_indicators(get_klines('1h'))
     c5, c1h = df_5m.iloc[-1], df_1h.iloc[-1]
     now = datetime.now(timezone.utc) + timedelta(hours=1)
     if now.minute >= 50: return None
-
-    # ⚠️ EMA trend filter
-    if c1h['ema50'] < c1h['ema200']: trend = 'bear'
-    else: trend = 'bull'
-
-    # ⚠️ ATR volatility filter
-    if c1h['atr'] < ATR_FILTER:
-        return None  # skip low volatility
-
-    # RSI neutral zone filter
-    if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
-        return None
-
-    # Skip overextended price vs BB
-    if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
-        return None
-
-    # Trend trades (EMA direction respected)
-    if trend == 'bull' and c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
-        return 'trend_buy'
-    if trend == 'bear' and c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
-        return 'trend_sell'
-
-    # Reversal trades require RSI divergence confirmation
-    if rsi_divergence(df_5m):
-        if c5['close'] < c5['bb_mid'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
-            return 'reversal_buy'
-        if c5['close'] > c5['bb_mid'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
-            return 'reversal_sell'
+    if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI: return None
+    if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']: return None
+    if c5['close']>c5['bb_mid'] and c5['close']<c5['bb_high'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'trend_buy'
+    if c5['close']<c5['bb_mid'] and c5['close']>c5['bb_low'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'trend_sell'
+    if c5['close']<c5['bb_mid'] and c5['close']>c5['open'] and c1h['close']>c1h['open']: return 'reversal_buy'
+    if c5['close']>c5['bb_mid'] and c5['close']<c5['open'] and c1h['close']<c1h['open']: return 'reversal_sell'
     return None
 
 # 🛠 Place stop order
 def place_order(order_type):
     global pending_order_id, pending_order_side, pending_order_time, sl_price, tp_price, trade_direction
-    if target_hit or in_position:
-        return
+    if target_hit or in_position: return
     side = 'buy' if 'buy' in order_type else 'sell'
 
     if pending_order_id and pending_order_side != side:
@@ -144,24 +106,20 @@ def place_order(order_type):
 
     ob = client_live.futures_order_book(symbol=SYMBOL)
     ask, bid = float(ob['asks'][0][0]), float(ob['bids'][0][0])
-    if ask - bid > SPREAD_THRESHOLD:
-        return
-    stop = round(ask + ENTRY_BUFFER, 2) if 'buy' in order_type else round(bid - ENTRY_BUFFER, 2)
+    if ask-bid > SPREAD_THRESHOLD: return
+    stop = round(ask+ENTRY_BUFFER,2) if 'buy' in order_type else round(bid-ENTRY_BUFFER,2)
 
     df_1h, df_5m = add_indicators(get_klines('1h')), add_indicators(get_klines('5m'))
     c1h, c5 = df_1h.iloc[-1], df_5m.iloc[-1]
+    sl_price = c1h['open'] if 'trend' in order_type else c5['open']
+    atr_val = round(c5['atr'], 2)  # 🆕 ATR for alert
 
-    # ATR-based SL/TP
-    atr = c5['atr']
-    sl_offset = atr * 0.5
-    tp_offset = atr * 1.5
-
-    if 'buy' in order_type:
-        sl_price = round(stop - sl_offset, 2)
-        tp_price = round(stop + tp_offset, 2)
+    if 'reversal' in order_type:
+        bb_mid = c5['bb_mid']
+        tp_price = round(bb_mid + 100 if 'buy' in order_type else bb_mid - 100, 2)
     else:
-        sl_price = round(stop + sl_offset, 2)
-        tp_price = round(stop - tp_offset, 2)
+        bb_tp = c5['bb_high'] if 'buy' in order_type else c5['bb_low']
+        tp_price = round(bb_tp + 100 if 'buy' in order_type else bb_tp - 100, 2)
 
     trade_direction = 'long' if 'buy' in order_type else 'short'
 
@@ -175,16 +133,24 @@ def place_order(order_type):
     pending_order_id, pending_order_side, pending_order_time = res['orderId'], side, datetime.utcnow()
 
     send_telegram(
-        f"🟩 *STOP ORDER PLACED*\n*Type:* `{order_type.upper()}`\n*Price:* `{stop}`\n*SL:* `{sl_price}` | *TP:* `{tp_price}`\n📍 Pending *({trade_direction})*"
+        f"🟩 *STOP ORDER PLACED*\n"
+        f"*Type:* `{order_type.upper()}`\n"
+        f"*Price:* `{stop}`\n"
+        f"*SL:* `{sl_price}` | *TP:* `{tp_price}`\n"
+        f"📊 *ATR(14):* `{atr_val}`\n"
+        f"📍 Pending *({trade_direction})*"
     )
-    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price, f"Pending({trade_direction})"])
+
+    log_trade_to_sheet([
+        str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price,
+        f"Pending({trade_direction}) | ATR:{atr_val}"
+    ])
 
 # 🔄 Manage trade
 def manage_trade():
     global trailing_peak, trailing_stop_price, current_trail_percent
     price = float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
-    if not entry_price:
-        return
+    if not entry_price: return
 
     profit_pct = (price - entry_price) / entry_price if trade_direction == 'long' else (entry_price - price) / entry_price
     profit_pct = abs(profit_pct)
@@ -234,7 +200,7 @@ def close_position(exit_price, reason):
     if "Take Profit" in reason:
         last_tp_hit_time = datetime.utcnow()
 
-    total_pnl = sum(p for p, _ in daily_trades)
+    total_pnl = sum(p for p,_ in daily_trades)
     if total_pnl >= DAILY_TARGET or total_pnl <= DAILY_LOSS_LIMIT:
         target_hit = True
 
@@ -251,8 +217,7 @@ def cancel_expired_order():
             try:
                 client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
                 send_telegram("⌛ *Pending stop order canceled after 10 minutes*")
-            except:
-                pass
+            except: pass
             pending_order_id, pending_order_time = None, None
 
 # 🚀 Bot loop
@@ -280,19 +245,17 @@ def bot_loop():
                         cancel_expired_order()
                 else:
                     s = check_signal()
-                    if s:
-                        place_order(s)
+                    if s: place_order(s)
             else:
                 manage_trade()
         except Exception as e:
             print("Error in loop:", e)
         time.sleep(120)
 
-# 🌐 Flask & daily report
+# 🌐 Flask + Daily report
 app = Flask(__name__)
 @app.route('/')
-def home():
-    return "🚀 Bot is live."
+def home(): return "🚀 Bot is live."
 
 def daily_report_loop():
     global target_hit

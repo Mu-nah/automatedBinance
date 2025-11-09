@@ -1,4 +1,3 @@
-# 🚀 START OF FULL BOT CODE (ATR VALUE ADDED TO ALERT)
 import os, time, json
 from datetime import datetime, timedelta, timezone
 import pandas as pd, threading
@@ -36,8 +35,10 @@ last_loss_pause_time = None
 # 📩 TELEGRAM
 def send_telegram(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+        )
     except:
         pass
 
@@ -121,8 +122,11 @@ def place_order(order_type):
     df_1h, df_5m = add_indicators(get_klines('1h')), add_indicators(get_klines('5m'))
     c1h, c5 = df_1h.iloc[-1], df_5m.iloc[-1]
 
-    # 🆕 Compute ATR
+    # 🆕 Compute ATR & Volume
     atr_value = float(c5['atr']) if not pd.isna(c5['atr']) else float(c1h['atr']) if not pd.isna(c1h['atr']) else 0.0
+    current_volume = float(c5['volume'])
+    prev_volume = float(df_5m.iloc[-2]['volume'])
+    volume_spike = current_volume > prev_volume * 1.5
 
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
     if 'reversal' in order_type:
@@ -142,16 +146,25 @@ def place_order(order_type):
     )
     pending_order_id, pending_order_side, pending_order_time = res['orderId'], side, datetime.utcnow()
 
-    # 🟩 ATR ADDED TO ALERT
+    # 🟩 ATR + VOLUME ADDED TO ALERT
+    vol_msg = f"📈 *Volume:* `{current_volume:.2f}`"
+    if volume_spike:
+        vol_msg += " 🔥 *High Volume Spike!*"
+
     send_telegram(
         f"🟩 *STOP ORDER PLACED*\n"
         f"*Type:* `{order_type.upper()}`\n"
         f"*Price:* `{stop}`\n"
         f"*SL:* `{sl_price}` | *TP:* `{tp_price}`\n"
         f"📊 *ATR(14):* `{atr_value:.2f}`\n"
+        f"{vol_msg}\n"
         f"📍 Pending *({trade_direction})*"
     )
-    log_trade_to_sheet([str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price, f"Pending({trade_direction}),ATR:{atr_value:.2f}"])
+
+    log_trade_to_sheet([
+        str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price,
+        f"Pending({trade_direction}),ATR:{atr_value:.2f},Vol:{current_volume:.2f}{'🔥' if volume_spike else ''}"
+    ])
 
 # 🔄 MANAGE TRADE
 def manage_trade():

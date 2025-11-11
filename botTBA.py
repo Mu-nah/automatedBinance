@@ -1,3 +1,5 @@
+# bot_full_volume_configurable.py
+# ✅ Full bot — trend trades only when 5m volume >= MIN_TREND_VOLUME
 import os, time, json
 from datetime import datetime, timedelta, timezone
 import pandas as pd, threading
@@ -17,11 +19,15 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 0.5, 4200
 DAILY_LOSS_LIMIT = -2000
 RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
+MIN_TREND_VOLUME = 200  # 👈 easily adjustable threshold for trend trades
 TELEGRAM_TOKEN, CHAT_ID, GSHEET_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"), os.getenv("GSHEET_ID")
 
 # ✅ CLIENTS
 client_testnet = Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
-client_testnet.futures_change_leverage(symbol=SYMBOL, leverage=10)
+try:
+    client_testnet.futures_change_leverage(symbol=SYMBOL, leverage=10)
+except Exception:
+    pass
 client_live = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 # ✅ STATE
@@ -68,7 +74,6 @@ def add_indicators(df):
     df['rsi'] = ta.momentum.rsi(df['close'], 14)
     bb = ta.volatility.BollingerBands(df['close'], 20, 2)
     df['bb_mid'], df['bb_high'], df['bb_low'] = bb.bollinger_mavg(), bb.bollinger_hband(), bb.bollinger_lband()
-    # 🆕 ATR
     df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
     return df
 
@@ -79,18 +84,25 @@ def check_signal():
         return None
     if last_tp_hit_time and datetime.utcnow() - last_tp_hit_time < timedelta(minutes=30):
         return None
+
     df_5m, df_1h = add_indicators(get_klines('5m')), add_indicators(get_klines('1h'))
     c5, c1h = df_5m.iloc[-1], df_1h.iloc[-1]
     now = datetime.now(timezone.utc) + timedelta(hours=1)
     if now.minute >= 50:
         return None
+
     if RSI_LO <= c5['rsi'] <= RSI_HI or RSI_LO <= c1h['rsi'] <= RSI_HI:
         return None
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
-    if c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
+
+    # ✅ Volume filter for trend trades only
+    current_volume = float(c5['volume'])
+    allow_trend = current_volume >= MIN_TREND_VOLUME
+
+    if allow_trend and c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
-    if c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
+    if allow_trend and c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'trend_sell'
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'reversal_buy'
@@ -121,9 +133,7 @@ def place_order(order_type):
 
     df_1h, df_5m = add_indicators(get_klines('1h')), add_indicators(get_klines('5m'))
     c1h, c5 = df_1h.iloc[-1], df_5m.iloc[-1]
-
-    # 🆕 Compute ATR & Volume
-    atr_value = float(c5['atr']) if not pd.isna(c5['atr']) else float(c1h['atr']) if not pd.isna(c1h['atr']) else 0.0
+    atr_value = float(c5['atr']) if not pd.isna(c5['atr']) else float(c1h['atr'])
     current_volume = float(c5['volume'])
     prev_volume = float(df_5m.iloc[-2]['volume'])
     volume_spike = current_volume > prev_volume * 1.5
@@ -137,14 +147,17 @@ def place_order(order_type):
         tp_price = round(bb_tp + 100 if 'buy' in order_type else bb_tp - 100, 2)
 
     trade_direction = 'long' if 'buy' in order_type else 'short'
-    res = client_testnet.futures_create_order(
-        symbol=SYMBOL,
-        side=SIDE_BUY if 'buy' in order_type else SIDE_SELL,
-        type=FUTURE_ORDER_TYPE_STOP_MARKET,
-        stopPrice=stop,
-        quantity=TRADE_QUANTITY
-    )
-    pending_order_id, pending_order_side, pending_order_time = res['orderId'], side, datetime.utcnow()
+    try:
+        res = client_testnet.futures_create_order(
+            symbol=SYMBOL,
+            side=SIDE_BUY if 'buy' in order_type else SIDE_SELL,
+            type=FUTURE_ORDER_TYPE_STOP_MARKET,
+            stopPrice=stop,
+            quantity=TRADE_QUANTITY
+        )
+        pending_order_id, pending_order_side, pending_order_time = res['orderId'], side, datetime.utcnow()
+    except Exception:
+        return
 
     # 🟩 ATR + VOLUME ADDED TO ALERT
     vol_msg = f"📈 *Volume:* `{current_volume:.2f}`"
@@ -169,19 +182,23 @@ def place_order(order_type):
 # 🔄 MANAGE TRADE
 def manage_trade():
     global trailing_peak, trailing_stop_price, current_trail_percent
-    price = float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
-    if not entry_price:
+    try:
+        price = float(client_live.futures_symbol_ticker(symbol=SYMBOL)['price'])
+    except Exception:
         return
-    profit_pct = (price - entry_price) / entry_price if trade_direction == 'long' else (entry_price - price) / entry_price
-    profit_pct = abs(profit_pct)
+    if entry_price is None:
+        return
+
+    profit_pct = abs((price - entry_price) / entry_price)
     if profit_pct >= 0.03: current_trail_percent = 0.015
     elif profit_pct >= 0.02: current_trail_percent = 0.01
     elif profit_pct >= 0.01: current_trail_percent = 0.005
+
     if trade_direction == 'long':
         if trailing_peak is None or price > trailing_peak:
             trailing_peak = price
             trailing_stop_price = trailing_peak * (1 - current_trail_percent)
-        if current_trail_percent > 0 and price <= trailing_stop_price:
+        if current_trail_percent and price <= trailing_stop_price:
             close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
         elif price >= tp_price:
             close_position(price, "Take Profit Hit")
@@ -191,7 +208,7 @@ def manage_trade():
         if trailing_peak is None or price < trailing_peak:
             trailing_peak = price
             trailing_stop_price = trailing_peak * (1 + current_trail_percent)
-        if current_trail_percent > 0 and price >= trailing_stop_price:
+        if current_trail_percent and price >= trailing_stop_price:
             close_position(price, f"Trailing Stop Hit ({current_trail_percent*100:.1f}%)")
         elif price <= tp_price:
             close_position(price, "Take Profit Hit")
@@ -202,7 +219,10 @@ def manage_trade():
 def close_position(exit_price, reason):
     global in_position, target_hit, last_tp_hit_time, last_loss_pause_time
     side = SIDE_SELL if trade_direction == 'long' else SIDE_BUY
-    client_testnet.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
+    try:
+        client_testnet.futures_create_order(symbol=SYMBOL, side=side, type=ORDER_TYPE_MARKET, quantity=TRADE_QUANTITY)
+    except:
+        pass
     pnl = round((exit_price - entry_price) if trade_direction == 'long' else (entry_price - exit_price), 2)
     is_win = pnl > 0
     daily_trades.append((pnl, is_win))

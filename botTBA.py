@@ -19,7 +19,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 0.5, 4200
 DAILY_LOSS_LIMIT = -2000
 RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
-MIN_TREND_VOLUME = 200  # 👈 easily adjustable threshold for trend trades
+MIN_TREND_VOLUME = 0  # 👈 easily adjustable threshold for trend trades
 TELEGRAM_TOKEN, CHAT_ID, GSHEET_ID = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"), os.getenv("GSHEET_ID")
 
 # ✅ CLIENTS
@@ -135,6 +135,7 @@ def place_order(order_type):
     c1h, c5 = df_1h.iloc[-1], df_5m.iloc[-1]
     atr_value = float(c5['atr']) if not pd.isna(c5['atr']) else float(c1h['atr'])
     current_volume = float(c5['volume'])
+    hourly_volume = float(c1h['volume'])  # 🆕 Added 1-hour volume
     prev_volume = float(df_5m.iloc[-2]['volume'])
     volume_spike = current_volume > prev_volume * 1.5
 
@@ -159,8 +160,11 @@ def place_order(order_type):
     except Exception:
         return
 
-    # 🟩 ATR + VOLUME ADDED TO ALERT
-    vol_msg = f"📈 *Volume:* `{current_volume:.2f}`"
+    # 🟩 ATR + VOLUME ADDED TO ALERT (includes 1h volume)
+    vol_msg = (
+        f"📈 *5m Volume:* `{current_volume:.2f}`\n"
+        f"🕐 *1h Volume:* `{hourly_volume:.2f}`"
+    )
     if volume_spike:
         vol_msg += " 🔥 *High Volume Spike!*"
 
@@ -176,7 +180,7 @@ def place_order(order_type):
 
     log_trade_to_sheet([
         str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price,
-        f"Pending({trade_direction}),ATR:{atr_value:.2f},Vol:{current_volume:.2f}{'🔥' if volume_spike else ''}"
+        f"Pending({trade_direction}),ATR:{atr_value:.2f},5mVol:{current_volume:.2f},1hVol:{hourly_volume:.2f}{'🔥' if volume_spike else ''}"
     ])
 
 # 🔄 MANAGE TRADE

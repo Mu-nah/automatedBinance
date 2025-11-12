@@ -1,6 +1,5 @@
-# bot_full_volume_configurable.py
-# ✅ Full bot — trend trades only when 5m volume >= MIN_TREND_VOLUME
-# Includes 5m + 1h volume alignment in Telegram alerts and Google Sheets log.
+# bot_full_volume_daily.py
+# ✅ Full bot — includes 5m + 1h + 1d volume and buy/sell alignment in Telegram alerts and Google Sheets logs.
 
 import os
 import time
@@ -28,7 +27,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 0.5, 4200
 DAILY_LOSS_LIMIT = -2000
 RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
-MIN_TREND_VOLUME = 0  # 👈 adjustable threshold for trend trades (5m volume)
+MIN_TREND_VOLUME = 0  # adjustable threshold for trend trades (5m volume)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GSHEET_ID = os.getenv("GSHEET_ID")
@@ -99,7 +98,6 @@ def get_klines(interval='5m', limit=100):
                       columns=['open_time','open','high','low','close','volume','close_time',
                                'quote_asset_volume','number_of_trades','taker_buy_base','taker_buy_quote','ignore'])
     df['time'] = pd.to_datetime(df['open_time'], unit='ms')
-    # cast core numeric columns
     for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = df[col].astype(float)
     return df
@@ -132,23 +130,18 @@ def check_signal():
     c5 = df_5m.iloc[-1]
     c1h = df_1h.iloc[-1]
 
-    now = datetime.now(timezone.utc) + timedelta(hours=1)  # your existing timezone offset logic
+    now = datetime.now(timezone.utc) + timedelta(hours=1)
     if now.minute >= 50:
         return None
 
-    # RSI filters
     if (RSI_LO <= c5['rsi'] <= RSI_HI) or (RSI_LO <= c1h['rsi'] <= RSI_HI):
         return None
-
-    # 1h BB filter
     if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
         return None
 
-    # Volume filter for trend trades only uses 5m volume threshold (MIN_TREND_VOLUME)
     current_volume = float(c5['volume'])
     allow_trend = current_volume >= MIN_TREND_VOLUME
 
-    # same logic as before — unchanged
     if allow_trend and c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
     if allow_trend and c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
@@ -160,7 +153,7 @@ def check_signal():
     return None
 
 # ========================
-# 🛠 PLACE STOP ORDER (with volume alignment check)
+# 🛠 PLACE STOP ORDER (with 5m + 1h + 1d volume alignment)
 # ========================
 def place_order(order_type):
     global pending_order_id, pending_order_side, pending_order_time, sl_price, tp_price, trade_direction
@@ -168,7 +161,6 @@ def place_order(order_type):
         return
     side = 'buy' if 'buy' in order_type else 'sell'
 
-    # cancel previous opposite pending order
     if pending_order_id and pending_order_side != side:
         try:
             client_testnet.futures_cancel_order(symbol=SYMBOL, orderId=pending_order_id)
@@ -177,41 +169,38 @@ def place_order(order_type):
         send_telegram("⚠ *Canceled previous pending order* (opposite signal)")
         pending_order_id = None
 
-    # orderbook & spread check
     ob = client_live.futures_order_book(symbol=SYMBOL)
     ask, bid = float(ob['asks'][0][0]), float(ob['bids'][0][0])
     if ask - bid > SPREAD_THRESHOLD:
         return
     stop = round(ask + ENTRY_BUFFER, 2) if 'buy' in order_type else round(bid - ENTRY_BUFFER, 2)
 
-    # fetch indicators
-    df_1h = add_indicators(get_klines('1h'))
     df_5m = add_indicators(get_klines('5m'))
-    c1h = df_1h.iloc[-1]
-    c5 = df_5m.iloc[-1]
+    df_1h = add_indicators(get_klines('1h'))
+    df_1d = add_indicators(get_klines('1d'))
+    c5, c1h, c1d = df_5m.iloc[-1], df_1h.iloc[-1], df_1d.iloc[-1]
 
-    # ATR, volumes
     atr_value = float(c5['atr']) if not pd.isna(c5['atr']) else float(c1h['atr'])
-    current_volume = float(c5['volume'])
-    hourly_volume = float(c1h['volume'])
+    current_volume, hourly_volume, daily_volume = float(c5['volume']), float(c1h['volume']), float(c1d['volume'])
     prev_volume = float(df_5m.iloc[-2]['volume'])
     volume_spike = current_volume > prev_volume * 1.5
 
-    # safe taker buy extraction & buy ratios
-    taker_buy_1h = safe_float(c1h.get("taker_buy_base", 0) if isinstance(c1h, pd.Series) else 0)
-    taker_buy_5m = safe_float(c5.get("taker_buy_base", 0) if isinstance(c5, pd.Series) else 0)
-    buy_ratio_1h = (taker_buy_1h / hourly_volume) if hourly_volume > 0 else 0.0
-    buy_ratio_5m = (taker_buy_5m / current_volume) if current_volume > 0 else 0.0
+    taker_buy_5m = safe_float(df_5m.iloc[-1]['taker_buy_base'])
+    taker_buy_1h = safe_float(df_1h.iloc[-1]['taker_buy_base'])
+    taker_buy_1d = safe_float(df_1d.iloc[-1]['taker_buy_base'])
+    buy_ratio_5m = taker_buy_5m / current_volume if current_volume > 0 else 0
+    buy_ratio_1h = taker_buy_1h / hourly_volume if hourly_volume > 0 else 0
+    buy_ratio_1d = taker_buy_1d / daily_volume if daily_volume > 0 else 0
 
-    # alignment emojis (buy_ratio > 0.5 => buy-dominant)
     if "buy" in order_type:
         align_5m = "🟢" if buy_ratio_5m > 0.5 else "🔴"
         align_1h = "🟢" if buy_ratio_1h > 0.5 else "🔴"
+        align_1d = "🟢" if buy_ratio_1d > 0.5 else "🔴"
     else:
         align_5m = "🟢" if buy_ratio_5m < 0.5 else "🔴"
         align_1h = "🟢" if buy_ratio_1h < 0.5 else "🔴"
+        align_1d = "🟢" if buy_ratio_1d < 0.5 else "🔴"
 
-    # SL/TP same as before
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
     if 'reversal' in order_type:
         bb_mid = c5['bb_mid']
@@ -222,7 +211,6 @@ def place_order(order_type):
 
     trade_direction = 'long' if 'buy' in order_type else 'short'
 
-    # place stop market order on testnet
     try:
         res = client_testnet.futures_create_order(
             symbol=SYMBOL,
@@ -235,10 +223,10 @@ def place_order(order_type):
     except Exception:
         return
 
-    # compose volume alignment message (5m + 1h)
     vol_msg = (
         f"📈 *5m Volume:* `{current_volume:.2f}` ({align_5m} {buy_ratio_5m*100:.1f}% buy)\n"
-        f"🕐 *1h Volume:* `{hourly_volume:.2f}` ({align_1h} {buy_ratio_1h*100:.1f}% buy)"
+        f"🕐 *1h Volume:* `{hourly_volume:.2f}` ({align_1h} {buy_ratio_1h*100:.1f}% buy)\n"
+        f"📅 *1d Volume:* `{daily_volume:.2f}` ({align_1d} {buy_ratio_1d*100:.1f}% buy)"
     )
     if volume_spike:
         vol_msg += " 🔥 *High Volume Spike!*"
@@ -253,10 +241,10 @@ def place_order(order_type):
         f"📍 Pending *({trade_direction})*"
     )
 
-    # log to sheet (keep original format + volume ratios)
     log_trade_to_sheet([
         str(datetime.utcnow()), SYMBOL, order_type, stop, sl_price, tp_price,
-        f"Pending({trade_direction}),ATR:{atr_value:.2f},5mVol:{current_volume:.2f},1hVol:{hourly_volume:.2f},5mBuyRatio:{buy_ratio_5m*100:.1f}%,1hBuyRatio:{buy_ratio_1h*100:.1f}%"
+        f"Pending({trade_direction}),ATR:{atr_value:.2f},5mVol:{current_volume:.2f},1hVol:{hourly_volume:.2f},1dVol:{daily_volume:.2f},"
+        f"5mBuy:{buy_ratio_5m*100:.1f}%,1hBuy:{buy_ratio_1h*100:.1f}%,1dBuy:{buy_ratio_1d*100:.1f}%"
     ])
 
 # ========================
@@ -279,7 +267,6 @@ def manage_trade():
     elif profit_pct >= 0.01:
         current_trail_percent = 0.005
 
-    # long logic
     if trade_direction == 'long':
         if trailing_peak is None or price > trailing_peak:
             trailing_peak = price
@@ -294,7 +281,6 @@ def manage_trade():
             close_position(price, "Stop Loss Hit")
             return
     else:
-        # short logic
         if trailing_peak is None or price < trailing_peak:
             trailing_peak = price
             trailing_stop_price = trailing_peak * (1 + current_trail_percent)
@@ -385,7 +371,6 @@ def bot_loop():
             else:
                 manage_trade()
         except Exception as e:
-            # preserve original behavior (don't crash loop)
             print("Error in loop:", e)
         time.sleep(120)
 

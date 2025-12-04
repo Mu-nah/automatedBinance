@@ -27,7 +27,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 SYMBOL, TRADE_QUANTITY, SPREAD_THRESHOLD, DAILY_TARGET = "BTCUSDT", 0.001, 0.5, 4200
 DAILY_LOSS_LIMIT = -2000
 RSI_LO, RSI_HI, ENTRY_BUFFER = 47, 53, 0.8
-MIN_TREND_VOLUME = 200  # adjustable threshold for trend trades (5m volume)
+MIN_TREND_VOLUME = 500  # adjustable threshold for trend trades (5m volume) — user requested 500
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GSHEET_ID = os.getenv("GSHEET_ID")
@@ -116,7 +116,7 @@ def safe_float(val):
         return 0.0
 
 # ========================
-# 📊 SIGNAL LOGIC
+# 📊 SIGNAL LOGIC (volume only affects trend; reversals ignored)
 # ========================
 def check_signal():
     global last_tp_hit_time
@@ -134,26 +134,35 @@ def check_signal():
     if now.minute >= 50:
         return None
 
-    if (RSI_LO <= c5['rsi'] <= RSI_HI) or (RSI_LO <= c1h['rsi'] <= RSI_HI):
-        return None
-    if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
-        return None
-
+    # volumes and flags
     current_volume = float(c5['volume'])
     allow_trend = current_volume >= MIN_TREND_VOLUME
 
+    # --- TREND-ONLY BLOCKERS: these should only block trend trades, not reversals ---
+    if allow_trend:
+        # block trend trades when RSI is neutral
+        if (RSI_LO <= c5['rsi'] <= RSI_HI) or (RSI_LO <= c1h['rsi'] <= RSI_HI):
+            return None
+        # block trend trades when 1h is at Bollinger extremes
+        if c1h['close'] >= c1h['bb_high'] or c1h['close'] <= c1h['bb_low']:
+            return None
+
+    # --- TREND SIGNALS (require volume) ---
     if allow_trend and c5['close'] > c5['bb_mid'] and c5['close'] < c5['bb_high'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'trend_buy'
     if allow_trend and c5['close'] < c5['bb_mid'] and c5['close'] > c5['bb_low'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'trend_sell'
+
+    # --- REVERSAL SIGNALS (VOLUME-INDEPENDENT) ---
     if c5['close'] < c5['bb_mid'] and c5['close'] > c5['open'] and c1h['close'] > c1h['open']:
         return 'reversal_buy'
     if c5['close'] > c5['bb_mid'] and c5['close'] < c5['open'] and c1h['close'] < c1h['open']:
         return 'reversal_sell'
+
     return None
 
 # ========================
-# 🛠 PLACE STOP ORDER (with 5m + 1h + 1d volume alignment)
+# 🛠 PLACE STOP ORDER (with 5m + 1h + 1d volume alignment for messaging only)
 # ========================
 def place_order(order_type):
     global pending_order_id, pending_order_side, pending_order_time, sl_price, tp_price, trade_direction
@@ -169,10 +178,16 @@ def place_order(order_type):
         send_telegram("⚠ *Canceled previous pending order* (opposite signal)")
         pending_order_id = None
 
-    ob = client_live.futures_order_book(symbol=SYMBOL)
-    ask, bid = float(ob['asks'][0][0]), float(ob['bids'][0][0])
+    # get orderbook and check spread
+    try:
+        ob = client_live.futures_order_book(symbol=SYMBOL)
+        ask, bid = float(ob['asks'][0][0]), float(ob['bids'][0][0])
+    except Exception:
+        return
+
     if ask - bid > SPREAD_THRESHOLD:
         return
+
     stop = round(ask + ENTRY_BUFFER, 2) if 'buy' in order_type else round(bid - ENTRY_BUFFER, 2)
 
     df_5m = add_indicators(get_klines('5m'))
@@ -201,6 +216,7 @@ def place_order(order_type):
         align_1h = "🟢" if buy_ratio_1h < 0.5 else "🔴"
         align_1d = "🟢" if buy_ratio_1d < 0.5 else "🔴"
 
+    # set SL & TP
     sl_price = c1h['open'] if 'trend' in order_type else c5['open']
     if 'reversal' in order_type:
         bb_mid = c5['bb_mid']
